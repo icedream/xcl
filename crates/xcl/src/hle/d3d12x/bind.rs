@@ -296,11 +296,12 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // so only its offset is applied; with a null or unmapped resource the GPU then reads the bare
     // offset, and a fault at GPU VA 0x5000 is exactly "resource 0 plus an offset of 0x5000" (DRED
     // on this title). Never hand the PC a null argument buffer, and say when one was untranslated.
-    if args == 0 || count_buf == 0 {
+    // (a null count buffer is legal: it means "use MaxCount" – only a null *argument* buffer is not)
+    if args == 0 {
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         count(DISPATCHES_SKIPPED);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a null argument buffer skipped (args {args:#x}, count {count_buf:#x})");
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a null argument buffer skipped (count {count_buf:#x})");
         }
         return;
     }

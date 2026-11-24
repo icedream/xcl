@@ -3645,6 +3645,22 @@ unsafe fn gpu_va(list: *mut c_void, va: u64, bytes: usize, what: &str, mirror: b
         return pc_va(p as u64);
     }
     if !crate::gpu::shader::readable(va as usize, bytes) {
+        // The bytes are not there to copy, and `t` is the title's own address – which is not a GPU
+        // address on the PC. Handing it to the driver is what the device removal at GPU VA 0x5000
+        // comes from (a small title address used as a vertex/index buffer). A zeroed copy of the
+        // same size keeps the shaders reading zeros instead of faulting.
+        if t < 0x1_0000 {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = super::bind::allocate_upload_memory(list, bytes, 16);
+            if !p.is_null() {
+                std::ptr::write_bytes(p, 0, bytes);
+                if n < 8 {
+                    crate::xlog_warn!("D3D12.X: {what} at {va:#x} is not readable and {t:#x} is no GPU address – bound as zeroed memory");
+                }
+                return pc_va(p as u64);
+            }
+        }
         return t;
     }
     if mirror {
