@@ -807,6 +807,9 @@ pub fn watch_writes(addr: usize) {
 
 /// probed addresses (DR1..DR3; DR0 stays the write watchpoint's)
 static PROBES: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+/// our vectored handler: re-registered from the arming loop, because a title that installs its
+/// own handler (Breakpad does at startup) goes ahead of ours and swallows the debug exception
+static PROBE_VEC: AtomicUsize = AtomicUsize::new(0);
 static PROBE_HITS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// the last logged values of each probe (a hit that repeats them is only counted)
 static PROBE_LAST: Mutex<[u64; 3]> = Mutex::new([0; 3]);
@@ -916,7 +919,7 @@ pub fn start_probes() {
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
     unsafe {
-        AddVectoredExceptionHandler(1, Some(probe_handler));
+        PROBE_VEC.store(AddVectoredExceptionHandler(1, Some(probe_handler)) as usize, Ordering::Release);
     }
     let _ = std::thread::Builder::new().name("xcl-probe".into()).spawn(move || {
         let base = loop {
@@ -933,6 +936,13 @@ pub fn start_probes() {
         let mut armed = std::collections::HashSet::new();
         loop {
             unsafe {
+                // stay first in the chain: drop and re-add, so a handler the title added later
+                // (its crash reporter) does not take the breakpoint from us
+                let old = PROBE_VEC.swap(0, Ordering::AcqRel);
+                if old != 0 {
+                    windows_sys::Win32::System::Diagnostics::Debug::RemoveVectoredExceptionHandler(old as *mut core::ffi::c_void);
+                }
+                PROBE_VEC.store(AddVectoredExceptionHandler(1, Some(probe_handler)) as usize, Ordering::Release);
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
                 if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
                     std::thread::sleep(std::time::Duration::from_millis(50));
