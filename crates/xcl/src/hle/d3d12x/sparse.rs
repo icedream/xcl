@@ -213,6 +213,12 @@ struct State {
     /// fence signalled on title queues so `queue` waits before copying GPU writes back to CPU
     rb_fence: ID3D12Fence,
     rb_value: u64,
+    /// fence the *title's* queues signal after each ExecuteCommandLists, and the last value:
+    /// `queue` (the sparse upload queue) waits on it before it writes tiles or remaps them, so it
+    /// never starts while the title's work still references the same resources (the D3D12 debug
+    /// layer reports exactly that as id 1047, "not safe to start write GPU operations now").
+    title_fence: Option<ID3D12Fence>,
+    title_value: u64,
     /// (window start, reserved buffer) of each sparse window
     windows: Vec<(usize, ID3D12Resource)>,
     /// video-memory pool heaps (None: given back, its index free for the next one)
@@ -549,6 +555,8 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             event,
             rb_fence,
             rb_value: 0,
+            title_fence: None,
+            title_value: 0,
             windows,
             pools: Vec::new(),
             free: Vec::new(),
@@ -716,6 +724,7 @@ impl State {
                 counts.push(run);
                 i += run as usize;
             }
+            gate_on_title(self);
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -754,6 +763,7 @@ impl State {
             counts.push(run);
             i += run as usize;
         }
+        gate_on_title(self);
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -876,6 +886,7 @@ impl State {
     /// Close and submit upload slot `idx` asynchronously (NO CPU wait — callers order GPU work
     /// via `queue.Wait(&self.fence, self.value)`).
     unsafe fn submit_slot(&mut self, idx: usize) {
+        gate_on_title(self);
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
@@ -1546,6 +1557,41 @@ static PHASES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub fn note_watch(t: std::time::Duration, pages: usize) {
     WATCH[0].fetch_add(t.as_micros() as u64, Ordering::Relaxed);
     WATCH[1].fetch_add(pages as u64, Ordering::Relaxed);
+}
+
+/// The title's queue submitted: signal a fence the sparse queue waits on before it writes or
+/// remaps tiles, so the two queues never touch the same resource at once (the debug layer reports
+/// the opposite order as id 1047 and calls it "race conditions and application instability").
+pub unsafe fn after_title_execute(title_queue: &ID3D12CommandQueue) {
+    // never block here: this runs on the title's submit path, and a busy state (another thread
+    // mapping tiles) must not stall it. Skipping a signal only leaves the gate at an older value.
+    let Ok(mut g) = STATE.try_lock() else { return };
+    let Some(s) = g.as_mut() else { return };
+    if s.title_fence.is_none() {
+        let made: windows::core::Result<ID3D12Fence> = s.dev.CreateFence(0, D3D12_FENCE_FLAG_NONE);
+        match made {
+            Ok(f) => {
+                let _ = f.SetName(windows::core::w!("xcl title submit fence"));
+                s.title_fence = Some(f);
+            }
+            Err(_) => return,
+        }
+    }
+    s.title_value += 1;
+    let v = s.title_value;
+    if let Some(f) = s.title_fence.as_ref() {
+        let _ = title_queue.Signal(f, v);
+    }
+}
+
+/// Before the sparse queue writes tiles or remaps them: wait for the title's last submission. The
+/// wait is idempotent (waiting on a value that already completed costs a submit-time check), which
+/// keeps this callable from the `&self` mapping paths.
+unsafe fn gate_on_title(s: &State) {
+    let (Some(f), v) = (s.title_fence.as_ref(), s.title_value) else { return };
+    if v > 0 {
+        let _ = s.queue.Wait(f, v);
+    }
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB

@@ -7457,6 +7457,10 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     });
     // the next uploads into textures kept in step start from the states these lists leave
     super::title_textures::submitted(&mapped);
+    // the sparse queue may only write or remap tiles once this submission has been signalled
+    if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&this) {
+        super::sparse::after_title_execute(q);
+    }
     super::present::note_execute(this, &mapped);
     stop_if_device_removed();
 }
