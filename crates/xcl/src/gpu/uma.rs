@@ -312,7 +312,14 @@ impl Uma {
     }
 
     /// The windows after the committed ones as one write-watched reservation (sparse windows).
+    /// `XCL_NO_SPARSE=1`: reserve none, so the title's GPU memory is the committed window only.
+    /// An experiment switch: the sparse path is where a streamed write and a tile mapping can
+    /// race the title's queue, and with it off the title either fits or fails to allocate.
     fn reserve_sparse_windows(&mut self) {
+        if std::env::var_os("XCL_NO_SPARSE").is_some() {
+            crate::xlog_warn!("UMA: XCL_NO_SPARSE – no sparse VRAM windows, the title gets the committed window only");
+            return;
+        }
         let committed = self.windows();
         if committed >= self.kinds.len() {
             return;

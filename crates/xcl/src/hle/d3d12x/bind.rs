@@ -198,7 +198,23 @@ pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_vo
 }
 
 /// #36 SetGraphicsRootDescriptorTable (PC #32)
+/// A descriptor table handle is a GPU address. One that is zero, or below every allocation, makes
+/// the GPU read its descriptors at that address, and a fault at a small address is what a null
+/// handle plus an offset looks like.
+fn note_table_handle(handle: u64, what: &'static str) {
+    if handle == 0 || handle < 0x1_0000 {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<(u64, &'static str)>> = Mutex::new(Vec::new());
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() < 8 && !g.iter().any(|e| e.0 == handle) {
+            g.push((handle, what));
+            crate::xlog_warn!("D3D12.X: {what} set to a descriptor table handle of {handle:#x} – below any allocation");
+        }
+    }
+}
+
 pub(super) unsafe extern "system" fn set_graphics_root_table(this: *mut c_void, i: u32, handle: u64) {
+    note_table_handle(handle, "graphics root table");
     put_in(this, true, i, 0, &(handle as u32).to_le_bytes());
 }
 
