@@ -291,7 +291,28 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
     let pso = super::pso_async::resolve_wait(raw_pso);
     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    let (d_args, d_count) = (super::real::buffer_delta(args), super::real::buffer_delta(count_buf));
+    // The PC reads the argument buffer from GPU memory. A resource XCL does not know has delta 0,
+    // so only its offset is applied; with a null or unmapped resource the GPU then reads the bare
+    // offset, and a fault at GPU VA 0x5000 is exactly "resource 0 plus an offset of 0x5000" (DRED
+    // on this title). Never hand the PC a null argument buffer, and say when one was untranslated.
+    if args == 0 || count_buf == 0 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        count(DISPATCHES_SKIPPED);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect with a null argument buffer skipped (args {args:#x}, count {count_buf:#x})");
+        }
+        return;
+    }
+    if (d_args == 0 && args_off != 0) || (d_count == 0 && count_off != 0) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!(
+                "D3D12.X: ExecuteIndirect with an untranslated argument buffer (args {args:#x} offset {args_off:#x}, count {count_buf:#x} offset {count_off:#x}, deltas {d_args:#x}/{d_count:#x})"
+            );
+        }
+    }
+    let (args_off, count_off) = (args_off + d_args, count_off + d_count);
     if !gfx && !compute {
         // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
         // the list may hold XCL's ABI root signature from a translated draw before it – the PC
