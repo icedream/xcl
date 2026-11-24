@@ -490,6 +490,14 @@ fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    if let Some(limit) = skip_big_src() {
+        let len = code_len(src);
+        if len > limit {
+            // The pipeline gets no translation, so its dispatches are skipped: the alternative on
+            // this hardware is a driver compile of minutes and a removed device.
+            return Err(format!("program skipped: {len} bytes of code over XCL_SKIP_BIG_SRC ({limit})"));
+        }
+    }
     let (reply, rx) = std::sync::mpsc::channel();
     let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply, wanted: crate::hle::d3d12x::pso_async::wanted_here() };
     pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
@@ -678,6 +686,14 @@ pub(super) fn toolchain_identity() -> &'static str {
         }
         format!("{h:016x}")
     })
+}
+
+/// `XCL_SKIP_BIG_SRC=<bytes>`: translate nothing above that much code. A retail title's world
+/// compute programs emit 362 KB and 1.19 MB of DXIL; the driver took 27-67 s for them and the
+/// D3D12 device was removed. Skipping them costs their dispatches and keeps the device.
+fn skip_big_src() -> Option<usize> {
+    static L: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *L.get_or_init(|| std::env::var("XCL_SKIP_BIG_SRC").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0))
 }
 
 /// Bytes of code in a translated source: the optimiser's work, without the emitter's comments

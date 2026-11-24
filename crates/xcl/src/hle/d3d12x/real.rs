@@ -509,14 +509,24 @@ pub(super) fn init_with_remap(allow_driver_remap: bool) -> Result<String, String
         }
         // `XCL_DRED=1`: on a device removal the faulting address and the last GPU operations
         // (logged by `log_device_removed`); no debug layer needed. Opt-in: with it XDefiant
-        // stalled in its first seconds twice.
-        if std::env::var_os("XCL_DRED").is_some() {
+        // stalled in its first seconds twice, which is why the two halves can be asked for
+        // separately – `XCL_DRED=fault` enables only the page-fault report (the faulting address
+        // and the allocations around it), `XCL_DRED=breadcrumbs` only the per-command markers.
+        if let Some(mode) = std::env::var("XCL_DRED").ok() {
+            let mode = mode.trim().to_ascii_lowercase();
+            let fault = mode != "breadcrumbs" && mode != "ac";
+            let breadcrumbs = mode != "fault" && mode != "pagefault";
             match crate::gpu::agility::configuration_interface::<ID3D12DeviceRemovedExtendedDataSettings>(
                 &CLSID_D3D12DeviceRemovedExtendedData,
             ) {
                 Ok(d) => {
-                    d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-                    d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    if breadcrumbs {
+                        d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
+                    if fault {
+                        d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    }
+                    crate::xlog_info!("D3D12: DRED page fault {fault}, auto breadcrumbs {breadcrumbs}");
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");

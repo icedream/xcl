@@ -225,6 +225,21 @@ pub(super) unsafe extern "system" fn set_graphics_root_descriptor(this: *mut c_v
 /// `XCL_TRACE_ADDRESSES=1`: root descriptor addresses of console code – in unified memory
 /// (translated shaders see them) or not – counted and logged
 fn note_address(va: u64) {
+    // A GPU address below 64 KiB belongs to no allocation of ours or of the title, so a bind that
+    // carries one hands the shader a base it cannot read: a fault at VA 0x5000 is "base 0 plus an
+    // offset of 0x5000", which is what an unbound or untranslated descriptor looks like. DRED
+    // reported exactly that on this title, so name the value and how often it is bound.
+    if va != 0 && va < 0x1_0000 {
+        use std::sync::Mutex;
+        static SMALL: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut g = SMALL.lock().unwrap_or_else(|e| e.into_inner());
+        if g.len() < 16 && !g.contains(&va) {
+            g.push(va);
+            crate::xlog_warn!("D3D12.X: root descriptor bound with GPU address {va:#x} – below any allocation (bind #{n})");
+        }
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static IN: AtomicU64 = AtomicU64::new(0);
     static OUT: AtomicU64 = AtomicU64::new(0);
