@@ -632,26 +632,12 @@ fn compile_whole(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Resul
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
-    // The thresholds below are about work for the optimiser, so they count the code, not the
-    // comments and indentation the emitter writes: 55.7 % of a translated program's bytes are
-    // comments and leading blanks, which made a 5 MB program read as an 8 MB source and take -O0.
-    let code_len: usize = src
-        .lines()
-        .map(|l| {
-            let t = l.trim();
-            if t.is_empty() || t.starts_with("//") {
-                0
-            } else {
-                t.len()
-            }
-        })
-        .sum();
     if !extra.iter().any(|a| a.starts_with("-O")) {
         // upstream's extra flags for the enormous sources, our measure of what "enormous" means
-        if code_len > UNOPTIMISED_ABOVE {
-            args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
-        } else if code_len > 1024 * 1024 {
-            args.push(crate::util::wide("-O1"));
+        if let Some(flags) = opt_level(src) {
+            for f in flags {
+                args.push(crate::util::wide(f));
+            }
         }
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
@@ -694,10 +680,51 @@ pub(super) fn toolchain_identity() -> &'static str {
     })
 }
 
+/// Bytes of code in a translated source: the optimiser's work, without the emitter's comments
+/// and indentation (55.7 % of a typical program).
+fn code_len(src: &str) -> usize {
+    src.lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with("//") {
+                0
+            } else {
+                t.len()
+            }
+        })
+        .sum()
+}
+
+/// The optimisation level for a translated source, or `None` for DXC's default. Part of the cache
+/// key: two runs that ask DXC for different levels produce different DXIL from the same source.
+fn opt_level(src: &str) -> Option<&'static [&'static str]> {
+    // `XCL_DXC_BIG_O0=<bytes>`: from that much code on, -O0 whatever the thresholds say. A retail
+    // title's world compute program (363 KB DXIL) took the driver 41.8 s at the default level and
+    // the D3D12 device was removed 2 s later.
+    let big = std::env::var("XCL_DXC_BIG_O0").ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let len = code_len(src);
+    if big.is_some_and(|limit| len > limit) || len > UNOPTIMISED_ABOVE {
+        // the enormous sources also get the optimiser's own switches disabled, as upstream asks
+        Some(&["-O0", "-opt-disable", "debug-nops"])
+    } else if len > 1024 * 1024 {
+        Some(&["-O1"])
+    } else {
+        None
+    }
+}
+
 /// FNV-1a 64 of the inputs that determine the DXIL.
 fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    let mut parts = [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src].to_vec();
+    // the level only joins the key when one is chosen: sources that take DXC's default keep the
+    // key they had before this was here, so an existing cache stays valid
+    if let Some(flags) = opt_level(src) {
+        for f in flags {
+            parts.push(f);
+        }
+    }
+    for part in parts {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
