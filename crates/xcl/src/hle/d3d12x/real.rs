@@ -1279,7 +1279,7 @@ static NON_UMA_BUFFER_VIEWS: AtomicU64 = AtomicU64::new(0);
 /// stride = element size, num_records in elements); empty when the buffer is not in UMA.
 fn buffer_view(res: usize, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
     let Some((at, bytes)) = console_buffer(res) else {
-        note_buffer_view();
+        note_empty_view("buffer (V#)");
         return [0; 4];
     };
     let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
@@ -1941,8 +1941,19 @@ unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
 }
 
 fn note_buffer_view() {
-    if NON_UMA_BUFFER_VIEWS.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("buffer view in the console heap: the buffer is not in UMA – the shader gets an empty V# (num_records 0)");
+    note_empty_view("buffer (V#)");
+}
+
+/// An empty descriptor written into the console heap: the shader reads base 0. Which kind it was
+/// matters when the GPU faults at a small address, so name it (once per kind).
+fn note_empty_view(kind: &'static str) {
+    static KINDS: std::sync::Mutex<Option<std::collections::HashSet<&'static str>>> = std::sync::Mutex::new(None);
+    let first = {
+        let mut g = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(Default::default).insert(kind)
+    };
+    if first {
+        crate::xlog_warn!("D3D12.X: empty {kind} descriptor written – the shader reads base 0");
     }
 }
 
@@ -1957,7 +1968,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
     let (va, size) = desc.as_ref().map_or((0, 0), |d| (d.BufferLocation, d.SizeInBytes));
     let in_uma = crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize));
     if !in_uma {
-        note_buffer_view();
+        note_empty_view("constant buffer (V#)");
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
     super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
@@ -2341,7 +2352,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     match srv_tsharp_from_desc(slot.index, &rdesc, desc.as_ref()) {
         Some(t) => super::console_heap::write(&slot, &t),
         None => {
-            note_buffer_view();
+            note_empty_view("shader resource (T#)");
             super::console_heap::write(&slot, &[0; 8]);
         }
     }
@@ -2722,7 +2733,7 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         None => (rd.Format, resource_dim_to_view(&rd), rd.DepthOrArraySize as u32, 0),
     };
     let Some((fmt, ty, w, h, d, _)) = view_shape(r, format, dim, array, 1) else {
-        note_buffer_view();
+        note_empty_view("unordered access (U#)");
         return super::console_heap::write(&slot, &[0; 8]);
     };
     // RDNA images have no SRV / UAV distinction: console shaders may read any image UAV slot
