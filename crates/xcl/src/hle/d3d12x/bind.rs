@@ -1029,6 +1029,38 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
+/// The last ABI binds (pso and the six root UAVs), for `log_device_removed`: a fault at a small
+/// GPU VA has to be traced to a bind, and the window VAs are the only addresses a translated
+/// shader reads besides its own buffers.
+static LAST_ABI: std::sync::Mutex<std::collections::VecDeque<([usize; 7])>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+pub fn note_abi_bind(pso: usize, views: &[u64; 6]) {
+    let mut g = LAST_ABI.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= 8 {
+        g.pop_front();
+    }
+    g.push_back([pso, views[0] as usize, views[1] as usize, views[2] as usize, views[3] as usize, views[4] as usize, views[5] as usize]);
+}
+
+/// Dumps the remembered binds (called by `real::log_device_removed`).
+pub fn dump_last_abi_binds() {
+    let g = LAST_ABI.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, b) in g.iter().enumerate() {
+        crate::xlog_error!(
+            "last ABI bind {}/{}: pso {:#x}, io {:#x}, res {:#x}, windows {:#x} {:#x} {:#x} {:#x}",
+            i + 1,
+            g.len(),
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6]
+        );
+    }
+}
+
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
@@ -1061,6 +1093,13 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
     let rs = rs as *mut c_void;
     let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
     let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().filter(|&v| v != 0).unwrap_or(first)));
+    {
+        let mut rec = [0u64; 6];
+        for (k, v) in views.clone().enumerate() {
+            rec[k] = v as u64;
+        }
+        note_abi_bind(pso, &rec);
+    }
     if gfx {
         list.SetGraphicsRootSignature(rs);
         for (k, v) in views.enumerate() {
