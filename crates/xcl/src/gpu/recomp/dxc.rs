@@ -632,10 +632,25 @@ fn compile_whole(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Resul
     // compile). -O0 only as a safety net for enormous sources.
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
+    // The thresholds below are about work for the optimiser, so they count the code, not the
+    // comments and indentation the emitter writes: 55.7 % of a translated program's bytes are
+    // comments and leading blanks, which made a 5 MB program read as an 8 MB source and take -O0.
+    let code_len: usize = src
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with("//") {
+                0
+            } else {
+                t.len()
+            }
+        })
+        .sum();
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > UNOPTIMISED_ABOVE {
+        // upstream's extra flags for the enormous sources, our measure of what "enormous" means
+        if code_len > UNOPTIMISED_ABOVE {
             args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
-        } else if src.len() > 1024 * 1024 {
+        } else if code_len > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
         }
     }
