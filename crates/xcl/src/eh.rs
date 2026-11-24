@@ -847,8 +847,24 @@ unsafe fn arm_context(c: &mut windows_sys::Win32::System::Diagnostics::Debug::CO
     }
 }
 
-unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
-    const SINGLE_STEP: u32 = 0x8000_0004;
+/// `XCL_PROBE_FILTER=rcx|rdx|r8|r9:<value>`: log only the hits whose register holds `<value>`.
+fn probe_filter() -> Option<(usize, u64)> {
+    static FILTER: std::sync::OnceLock<Option<(usize, u64)>> = std::sync::OnceLock::new();
+    *FILTER.get_or_init(|| {
+        let spec = std::env::var("XCL_PROBE_FILTER").ok()?;
+        let (reg, value) = spec.split_once(':')?;
+        let i = match reg.trim().to_ascii_lowercase().as_str() {
+            "rdx" => 1,
+            "r8" => 2,
+            "r9" => 3,
+            _ => 0,
+        };
+        let v = u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()?;
+        Some((i, v))
+    })
+}
+
+unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {    const SINGLE_STEP: u32 = 0x8000_0004;
     let rec = &*(*info).ExceptionRecord;
     let ctx = &mut *(*info).ContextRecord;
     if rec.ExceptionCode as u32 == PROBE_ARM {
@@ -864,6 +880,19 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // resume flag: the instruction runs without breaking again
     ctx.EFlags |= 0x1_0000;
     let n = PROBE_HITS[k].fetch_add(1, Ordering::Relaxed) + 1;
+    // `XCL_PROBE_FILTER=rcx:0x…` (or rdx/r8/r9): log only the hits whose register holds that
+    // value – for a hot function where the one call that matters is far past the log's budget.
+    if let Some((reg, want)) = probe_filter() {
+        let got = match reg {
+            1 => ctx.Rdx,
+            2 => ctx.R8,
+            3 => ctx.R9,
+            _ => ctx.Rcx,
+        };
+        if got != want {
+            return -1;
+        }
+    }
     // at a function's entry: arguments 5 and 6 above the return address and the home area
     let stack = |i: u64| probe_bytes(ctx.Rsp + 8 * i, 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
     let (s5, s6) = (stack(5), stack(6));
@@ -900,6 +929,42 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
 /// title's code runs, with what, without changing it.
 pub fn start_probes() {
+    // `XCL_DUMP=rva:len:path:seconds` (all hex but the path and seconds): after that many seconds,
+    // write `len` bytes of the title's image at `rva` to `path`, then go on. Read from inside the
+    // process, which is the only place a title's engine tables can be read (OpenProcess from
+    // outside is refused even for the same user).
+    if let Some(spec) = std::env::var("XCL_DUMP").ok() {
+        let _ = std::thread::Builder::new().name("xcl-dump".into()).spawn(move || {
+            // `rva:len:path:seconds` – the path holds colons of its own, so the seconds are
+            // taken off the end and the path is everything in between
+            let (head, secs) = match spec.rsplit_once(':') {
+                Some((h, s)) if s.trim().parse::<u64>().is_ok() => (h, s.trim().parse::<u64>().unwrap()),
+                _ => (spec.as_str(), 30),
+            };
+            let mut it = head.splitn(3, ':');
+            let rva = it.next().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
+            let len = it.next().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
+            let path = it.next().unwrap_or("xcl-dump.bin").to_string();
+            let (Some(rva), Some(len)) = (rva, len) else { return };
+            let base = loop {
+                if let Some(m) = modules::main_module() {
+                    break m.base;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let at = base + rva;
+            if !crate::gpu::shader::readable(at, len) {
+                crate::xlog_warn!("dump: {:#x} for {:#x} is not readable", at, len);
+                return;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+            match std::fs::write(&path, bytes) {
+                Ok(()) => crate::xlog_info!("dump: {len:#x} bytes at {} -> {path}", modules::describe_address(at)),
+                Err(e) => crate::xlog_warn!("dump: {path}: {e}"),
+            }
+        });
+    }
     // `XCL_WATCH=rva` (hex, in the title's exe): every write to those 8 bytes is logged with
     // the writing code (`watch_writes`) – who fills a field the title later trips over
     if let Some(rva) = std::env::var("XCL_WATCH").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
