@@ -72,16 +72,18 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut c as *mut _ as *mut _, c.cb);
                     c.PrivateUsage
                 };
-                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (local, non_local, local_budget, non_local_budget) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0, 0, 0));
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {}/{} MB local, {}/{} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
                     mb(private as u64),
                     mb(local),
+                    mb(local_budget),
                     mb(non_local),
+                    mb(non_local_budget),
                     mb(pages as u64),
                     mb(page_pools as u64),
                     mb(arenas as u64),

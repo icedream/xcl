@@ -118,6 +118,8 @@ impl Pending {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
+/// stand-ins whose real pipeline is not built yet (`counts`)
+static PENDING_OPEN: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     /// why the build this thread is running returned no pipeline (`note_failure`, `complete`)
@@ -178,11 +180,14 @@ fn complete(p: &Pending, real: usize) {
         if !orphan {
             p.real.store(real, Ordering::Release);
         }
+        if !*done {
+            PENDING_OPEN.fetch_sub(1, Ordering::Relaxed);
+        }
         *done = true;
         p.cv.notify_all();
         orphan
     };
-    // outside `done`: the Release override takes PENDING (`counts` takes PENDING, then `done`)
+    // outside `done`: the Release override takes PENDING, then `done`
     if orphan {
         release(real);
     }
@@ -328,6 +333,9 @@ fn drop_unstarted_job(p: &Pending) {
     if let Some(job) = job {
         {
             let mut done = p.done.lock().unwrap();
+            if !*done {
+                PENDING_OPEN.fetch_sub(1, Ordering::Relaxed);
+            }
             *done = true;
             p.cv.notify_all();
         }
@@ -448,6 +456,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
+    PENDING_OPEN.fetch_add(1, Ordering::Relaxed);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
@@ -1276,6 +1285,60 @@ pub fn need_by_submit(pso: usize) {
 
 /// (built in the background, failed, still building)
 pub fn counts() -> (usize, usize, usize) {
-    let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
-    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+    (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), PENDING_OPEN.load(Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod counts_tests {
+    use super::*;
+
+    /// the open-pending counter tracks stand-ins whose real pipeline is not built yet: it
+    /// rises by one on a registration and falls by one on a build's end – a failed one
+    /// (real == 0) included – so `counts` is constant time and takes no `PENDING` lock.
+    #[test]
+    fn the_open_counter_tracks_stand_ins_not_built_yet() {
+        // the invariant: the counter equals the number of stand-ins not built yet. the
+        // stand-ins below are not sent to the workers, so only this thread completes them;
+        // the snapshot retries until no other test's build ends mid-scan.
+        let snap = || loop {
+            let o1 = PENDING_OPEN.load(Ordering::Relaxed);
+            let s = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+            let o2 = PENDING_OPEN.load(Ordering::Relaxed);
+            if o1 == o2 {
+                assert_eq!(o1, s, "the open counter equals the number not built yet");
+                return;
+            }
+        };
+        let standins: [usize; 5] = [0x7E57_C001, 0x7E57_C002, 0x7E57_C003, 0x7E57_C004, 0x7E57_C005];
+        let mine = || standins.iter().filter(|s| is_pending(**s)).count();
+
+        snap();
+        submit_lazy(standins[0], false, Box::new(|| 0x1234), 0); // not sent: stays pending
+        submit_lazy(standins[1], false, Box::new(|| 0), 0); // will fail (real == 0)
+        submit_lazy(standins[2], false, Box::new(|| 0x1234), 0);
+        submit_lazy(standins[3], false, Box::new(|| 0x1234), 0);
+        submit_lazy(standins[4], false, Box::new(|| 0x1234), 0);
+        assert_eq!(mine(), 5, "five registered, all not built yet");
+        snap();
+
+        // a successful build lowers the count
+        assert_eq!(resolve_wait_for(standins[0], None), 0x1234);
+        assert_eq!(mine(), 4, "a successful build ends its stand-in");
+        snap();
+
+        // a failed build (real == 0) lowers it too: the stand-in is returned, the entry is done
+        assert_eq!(resolve_wait_for(standins[1], None), standins[1], "a failed build returns the stand-in");
+        assert_eq!(mine(), 3, "a failed build ends its stand-in too");
+        snap();
+
+        // releasing the rest orphans them: their jobs drop and they end done
+        for &s in &standins[2..] {
+            assert_eq!(released(s), 0, "an orphaned stand-in had no real pipeline yet");
+        }
+        // the two built return their real pipelines (0x1234 is no real pipeline: taken, not released)
+        assert_eq!(released(standins[0]), 0x1234);
+        assert_eq!(released(standins[1]), 0);
+        assert_eq!(mine(), 0, "all released, none of these are pending");
+        snap();
+    }
 }
