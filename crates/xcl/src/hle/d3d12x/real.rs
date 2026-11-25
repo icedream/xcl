@@ -100,6 +100,9 @@ pub struct D3d12Stats {
     pub unknown_iids: Vec<String>,
     pub fallback_pipelines: u64,
     pub failed_pipelines: u64,
+    /// builds that returned no pipeline, by reason (`pso_async::failed_reasons`)
+    #[serde(default)]
+    pub failed_pipeline_reasons: std::collections::BTreeMap<String, u64>,
     pub fallback_root_signatures: u64,
     pub presents: u64,
     pub frame_boundaries: u64,
@@ -403,6 +406,7 @@ pub fn stats() -> D3d12Stats {
         unknown_iids: UNKNOWN_IIDS.lock().map(|s| s.iter().cloned().collect()).unwrap_or_default(),
         fallback_pipelines: FALLBACK_PSO.load(Ordering::Relaxed),
         failed_pipelines: FAILED_PSO.load(Ordering::Relaxed),
+        failed_pipeline_reasons: super::pso_async::failed_reasons().into_iter().map(|(r, n)| (r.to_string(), n as u64)).collect(),
         fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
         presents,
         frame_boundaries: boundaries,
@@ -4415,21 +4419,28 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+        super::pso_async::note_failure("compute desc not readable", String::new());
         return None;
     }
     let d = &*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
-    let cs = shader_bytes(&d.CS)?;
+    let Some(cs) = shader_bytes(&d.CS) else {
+        super::pso_async::note_failure("compute desc has no CS bytecode", String::new());
+        return None;
+    };
     if !is_console(cs) {
+        super::pso_async::note_failure("CS is not console bytecode", format!("{} B", cs.len()));
         return None;
     }
     // made when first bound (`pso_async::lazy`): not even translated now
     if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        super::pso_async::note_failure("deferred to the first bind", String::new());
         return Some(Err(()));
     }
     let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
         Ok(b) => b,
         Err(e) => {
             note_translation_error(format!("CS: {e}"));
+            super::pso_async::note_failure("CS translation failed", e.to_string());
             return Some(Err(()));
         }
     };
@@ -4444,6 +4455,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             if N.fetch_add(1, Ordering::Relaxed) < 8 {
                 crate::xlog_warn!("D3D12.X: compute PSO of {} bytes of DXIL not handed to the driver (XCL_SKIP_BIG_DXIL={limit}) – stand-in", dxil.len());
             }
+            super::pso_async::note_failure("DXIL above XCL_SKIP_BIG_DXIL", format!("{} B DXIL, limit {limit}", dxil.len()));
             return Some(Err(()));
         }
     }
@@ -4452,6 +4464,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
     let big = dxil.len() >= huge_pso_bytes();
     if big && crate::gpu::recomp::dxc::defer() {
+        super::pso_async::note_failure("big program deferred to the first bind", format!("{} B DXIL", dxil.len()));
         return Some(Err(()));
     }
     let record = crate::gpu::shader::fnv64(cs);
@@ -4476,7 +4489,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let (rs, (hr, in_driver, reused)) = match warm {
         Some(hit) => hit,
         None => {
-            let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
+            let Some(rs) = abi_rs_for(this, &compiled.samplers) else {
+                super::pso_async::note_failure("no root signature for the CS", format!("{} B DXIL", dxil.len()));
+                return Some(Err(()));
+            };
             (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
         }
     };
@@ -4497,6 +4513,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             );
         }
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        super::pso_async::note_failure("the driver refused the translated CS", format!("{} B DXIL, {hr:#x}", dxil.len()));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -5774,6 +5791,7 @@ unsafe fn go_background(
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let job: super::pso_async::Job = Box::new(move || {
+        super::pso_async::clear_failure();
         let mut out: *mut c_void = std::ptr::null_mut();
         if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
             out as usize

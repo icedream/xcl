@@ -119,10 +119,56 @@ impl Pending {
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
 
+thread_local! {
+    /// why the build this thread is running returned no pipeline (`note_failure`, `complete`)
+    static FAILURE: std::cell::RefCell<Option<(&'static str, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Forget the last build's reason: a job starts with none.
+pub fn clear_failure() {
+    FAILURE.with(|f| *f.borrow_mut() = None);
+}
+
+/// The build running on this thread returns no pipeline for `reason` (`detail`: its size, its
+/// HRESULT…, for the log only: the tally counts reasons).
+pub fn note_failure(reason: &'static str, detail: String) {
+    FAILURE.with(|f| *f.borrow_mut() = Some((reason, detail)));
+}
+
+/// failed builds by reason (`failed_reasons`)
+static FAILED_REASONS: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
+
+/// The failed builds by reason, for the report.
+pub fn failed_reasons() -> Vec<(&'static str, usize)> {
+    FAILED_REASONS.lock().unwrap().clone()
+}
+
+/// A build returned no pipeline: count its reason, and log the first 8 of each (and every 1000th).
+fn count_failure() {
+    let (reason, detail) = FAILURE.with(|f| f.borrow_mut().take()).unwrap_or(("no reason recorded", String::new()));
+    let n = {
+        let mut all = FAILED_REASONS.lock().unwrap();
+        match all.iter_mut().find(|r| r.0 == reason) {
+            Some(r) => {
+                r.1 += 1;
+                r.1
+            }
+            None => {
+                all.push((reason, 1));
+                1
+            }
+        }
+    };
+    if n <= 8 || n % 1000 == 0 {
+        crate::xlog_warn!("D3D12.X: a pipeline build returned none: {reason}{}{detail} (#{n} of this reason)", if detail.is_empty() { "" } else { " – " });
+    }
+}
+
 /// The build is done (`real`: its pipeline, 0 = failed).
 fn complete(p: &Pending, real: usize) {
     if real == 0 {
         FAILED.fetch_add(1, Ordering::Relaxed);
+        count_failure();
     } else {
         BUILT.fetch_add(1, Ordering::Relaxed);
     }
