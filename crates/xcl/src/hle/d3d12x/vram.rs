@@ -999,7 +999,15 @@ fn tile_mips_keep() -> Option<u32> {
     *V.get_or_init(|| std::env::var("XCL_TILE_MIPS").ok().as_deref().and_then(parse_tile_mips))
 }
 
-/// `XCL_TILE_MIPS_DRY=1`: log what `XCL_TILE_MIPS` would cut and map every tile as before.
+/// `XCL_TILE_MIPS_SKIP=<s>`: the opposite cut, the first s mips unmapped and the large mips kept.
+/// Only the dry run reads it so far, whether or not `XCL_TILE_MIPS` is set.
+fn tile_mips_skip() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_TILE_MIPS_SKIP").ok().as_deref().and_then(parse_tile_mips))
+}
+
+/// `XCL_TILE_MIPS_DRY=1`: log what `XCL_TILE_MIPS` and `XCL_TILE_MIPS_SKIP` would cut and map every
+/// tile as before.
 fn tile_mips_dry() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("XCL_TILE_MIPS_DRY").ok().is_some_and(|v| v.trim() == "1"))
@@ -1010,6 +1018,13 @@ fn tile_mips_dry() -> bool {
 /// mip's slot, which takes none of these).
 fn mip_prefix_tiles(total: u32, starts: &[u32], keep: u32) -> u32 {
     starts.get(keep as usize).copied().filter(|&s| s != u32::MAX).unwrap_or(total).min(total)
+}
+
+/// How many of `total` tiles skipping the first `skip` mips frees: they start at `starts[skip]`, so
+/// that is the freed count and `total - starts[skip]` the kept one. A `skip` past the standard mips
+/// frees the whole resource (`u32::MAX`: a packed mip's slot, which takes none of these).
+fn mip_skip_prefix_tiles(total: u32, starts: &[u32], skip: u32) -> u32 {
+    starts.get(skip as usize).copied().filter(|&s| s != u32::MAX).unwrap_or(total).min(total)
 }
 
 /// The reason `log_mip_cut` skips a texture, in the order checked (the first match wins):
@@ -1059,10 +1074,11 @@ unsafe fn resolved_mips(dev: &ID3D12Device, res: &ID3D12Resource, desc_mips: u16
     packed.NumStandardMips as u32 + packed.NumPackedMips as u32
 }
 
-/// The tiles `mip_prefix_tiles` would keep for `res`, logged and counted for `XCL_TILE_MIPS_DRY`.
-/// The per-mip tile counts are the PC driver's, not the console's: the PC's tile shapes and packed
-/// tail are not XG's.
-unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32, keep: u32) {
+/// The tiles `mip_prefix_tiles` would keep and `mip_skip_prefix_tiles` would free for `res`, logged
+/// and counted for `XCL_TILE_MIPS_DRY`; both cuts share the eligibility and the counters' framing so
+/// one run reports them side by side. The per-mip tile counts are the PC driver's, not the console's:
+/// the PC's tile shapes and packed tail are not XG's.
+unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32, keep: Option<u32>, skip: Option<u32>) {
     static SKIP_D3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static SKIP_ARR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static SKIP_MSAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1072,6 +1088,8 @@ unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RES
     static TEXTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(why) = mip_skip_reason(desc) {
         let c = match why {
             MipSkip::D3 => &SKIP_D3,
@@ -1092,27 +1110,57 @@ unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RES
     let mut subresources = mips;
     dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subresources), 0, tilings.as_mut_ptr());
     let starts: Vec<u32> = tilings[..(packed.NumStandardMips as usize).min(tilings.len())].iter().map(|t| t.StartTileIndexInOverallResource).collect();
-    let kept = mip_prefix_tiles(total, &starts, keep);
+    let kept = keep.map(|keep| mip_prefix_tiles(total, &starts, keep));
+    let freed = skip.map(|skip| mip_skip_prefix_tiles(total, &starts, skip));
     if TEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
-        crate::xlog_info!(
-            "D3D12.X: tile mips: {}x{} format {} mips {mips}{} keep {keep}: tiles {total} -> {kept} ({}% kept)",
-            desc.Width, desc.Height, desc.Format.0, if full { " (full chain)" } else { "" }, 100 * kept / total.max(1)
+        let mut line = format!(
+            "D3D12.X: tile mips: {}x{} format {} mips {mips}{}",
+            desc.Width, desc.Height, desc.Format.0, if full { " (full chain)" } else { "" }
         );
+        if let (Some(keep), Some(kept)) = (keep, kept) {
+            line += &format!(" keep {keep}: tiles {total} -> {kept} ({}% kept)", 100 * kept / total.max(1));
+        }
+        if let (Some(skip), Some(freed)) = (skip, freed) {
+            let after = total - freed;
+            line += &format!(" skip {skip}: tiles {total} -> {after} ({}% kept)", 100 * after / total.max(1));
+        }
+        crate::xlog_info!("{line}");
     }
-    let (orig, mapped) = (
-        TILES.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed) + total as u64,
-        KEPT.fetch_add(kept as u64, std::sync::atomic::Ordering::Relaxed) + kept as u64,
-    );
-    if kept < total {
+    // cumulative over every measured texture, cut or not, so one line covers the whole run
+    let (orig, mapped) = match kept {
+        Some(kept) => (
+            TILES.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed) + total as u64,
+            KEPT.fetch_add(kept as u64, std::sync::atomic::Ordering::Relaxed) + kept as u64,
+        ),
+        None => (0, 0),
+    };
+    let (skip_orig, skip_after) = match freed {
+        Some(freed) => {
+            let after = (total - freed) as u64;
+            (
+                SKIP_TILES.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed) + total as u64,
+                SKIP_KEPT.fetch_add(after, std::sync::atomic::Ordering::Relaxed) + after,
+            )
+        }
+        None => (0, 0),
+    };
+    if kept.is_some_and(|kept| kept < total) || freed.is_some_and(|freed| freed > 0) {
         let n = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // the first cuts and then every power of two: a title makes thousands of textures
         if n < 16 || n.is_power_of_two() {
             let rel = std::sync::atomic::Ordering::Relaxed;
             let s = SKIP_D3.load(rel) + SKIP_ARR.load(rel) + SKIP_MSAA.load(rel) + SKIP_GPU.load(rel) + SKIP_ONE.load(rel);
-            crate::xlog_info!(
-                "D3D12.X: tile mips: {n} textures cut ({s} skipped: {} 3d, {} array or cube, {} msaa, {} gpu-owned, {} single mip), tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)",
-                SKIP_D3.load(rel), SKIP_ARR.load(rel), SKIP_MSAA.load(rel), SKIP_GPU.load(rel), SKIP_ONE.load(rel), 100 * mapped / orig.max(1), (orig - mapped) >> 4
+            let mut line = format!(
+                "D3D12.X: tile mips: {n} textures cut ({s} skipped: {} 3d, {} array or cube, {} msaa, {} gpu-owned, {} single mip)",
+                SKIP_D3.load(rel), SKIP_ARR.load(rel), SKIP_MSAA.load(rel), SKIP_GPU.load(rel), SKIP_ONE.load(rel)
             );
+            if kept.is_some() {
+                line += &format!(", tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)", 100 * mapped / orig.max(1), (orig - mapped) >> 4);
+            }
+            if let Some(skip) = skip {
+                line += &format!(", skip {skip}: tiles {skip_orig} -> {skip_after} ({}% kept, {} MiB freed)", 100 * skip_after / skip_orig.max(1), (skip_orig - skip_after) >> 4);
+            }
+            crate::xlog_info!("{line}");
         }
     }
 }
@@ -1180,8 +1228,9 @@ unsafe fn place_on_pages(
     // XCL_TILE_MIPS_DRY: what the cut would save. Unset, the extra tiling call and its log do not
     // happen and `total` stays the driver's.
     if tile_mips_dry() {
-        if let Some(keep) = tile_mips_keep() {
-            log_mip_cut(dev, res, &tiled, total, keep);
+        let (keep, skip) = (tile_mips_keep(), tile_mips_skip());
+        if keep.is_some() || skip.is_some() {
+            log_mip_cut(dev, res, &tiled, total, keep, skip);
         }
     }
     let bound = {
@@ -1673,6 +1722,24 @@ mod tests {
         assert_eq!(mip_prefix_tiles(22, &[], 1), 22);
         // a packed mip's slot takes no tiles of its own
         assert_eq!(mip_prefix_tiles(22, &[0, u32::MAX], 1), 22);
+    }
+
+    /// The same 1024x1024 BC7, cut the other way: skipping mip 0 frees its 16 tiles, skipping 0..1
+    /// frees 20, and a skip past the standard mips frees the whole resource.
+    #[test]
+    fn mip_skip_prefix_tiles_frees_the_mips_before_s() {
+        let starts = [0, 16, 20];
+        assert_eq!(mip_skip_prefix_tiles(22, &starts, 1), 16);
+        assert_eq!(mip_skip_prefix_tiles(22, &starts, 2), 20);
+        // past the standard mips: nothing is left to free
+        assert_eq!(mip_skip_prefix_tiles(22, &starts, 3), 22);
+        assert_eq!(mip_skip_prefix_tiles(22, &starts, 11), 22);
+        assert_eq!(mip_skip_prefix_tiles(22, &starts, u32::MAX), 22);
+        assert_eq!(mip_skip_prefix_tiles(22, &[], 1), 22);
+        // a packed mip's slot takes no tiles of its own
+        assert_eq!(mip_skip_prefix_tiles(22, &[0, u32::MAX], 1), 22);
+        // never more than the driver's total
+        assert_eq!(mip_skip_prefix_tiles(18, &starts, 2), 18);
     }
 
     /// Each way `log_mip_cut` skips a texture selects its reason, and the first match wins; a
