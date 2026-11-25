@@ -876,11 +876,45 @@ fn note_request(r: &Request) {
     }
 }
 
+/// Best effort: the payload goes straight to the destination address (title addresses are XCL's
+/// own memory here), used when a request's page list cannot be resolved.
+unsafe fn write_through_destination(r: &Request, payload: &[u8]) {
+    let p = r.destination as usize;
+    let n = payload.len();
+    if n == 0 || !writable(p, n) {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count < 8 {
+        crate::xlog_warn!("DirectStorage: wrote {n} bytes through destination {p:#x} (page list unresolvable)");
+    }
+    std::ptr::copy_nonoverlapping(payload.as_ptr(), p as *mut u8, n);
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, dest_on_stack: bool, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
+        // The bytes are then never delivered, and a streaming title can wait on them for ever.
+        // Say what the range actually is, so a range XCL should have committed is distinguishable
+        // from one the title never prepared.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            let p = r.destination as usize;
+            let mut m: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let q = unsafe { VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) };
+            let uma = crate::gpu::uma::get();
+            crate::xlog_warn!(
+                "DirectStorage: destination {p:#x} ({n} bytes) is not writable – VirtualQuery {q}, state {:#x}, protect {:#x}, region {:#x} bytes; in committed window {:?}, sparse {:?}",
+                m.State,
+                m.Protect,
+                m.RegionSize,
+                uma.as_ref().map(|u| u.in_committed_window(p, n)),
+                uma.as_ref().map(|u| u.contains(p))
+            );
+        }
         return Err(E_ACCESS_VIOLATION);
     }
     let src: Vec<u8> = if r.memory_source() {
@@ -933,7 +967,13 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
-        let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+        // A page list that cannot be resolved used to drop the bytes, and a streaming title then
+        // waits on that data for ever (its load never completes). The destination address is
+        // XCL's own memory for these requests, so write through it instead.
+        let Some(pages) = dest_pages else {
+            write_through_destination(r, &payload[..n as usize]);
+            return Ok(());
+        };
         // The console reads the page list when it runs the request. A retail title keeps its
         // lists in slots of its own table and writes a slot's pages after EnqueueRequest, so at
         // enqueue a slot can still name the pages of its previous request: written there, the
@@ -977,7 +1017,20 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             pages
         };
         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
-            return Err(E_ACCESS_VIOLATION);
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = r.destination as usize;
+            if !writable(p, n as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            if n < 8 {
+                crate::xlog_warn!(
+                    "DirectStorage: {} page(s) from {p:#x} could not be resolved – wrote {} bytes through the destination address instead",
+                    pages.len(),
+                    n as usize
+                );
+            }
+            write_through_destination(r, &payload[..n as usize]);
         }
     } else if n > 0 {
         std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
