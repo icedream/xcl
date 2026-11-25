@@ -2861,8 +2861,9 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
 }
 
 /// `XCL_RT_SCALE_PLACED=<0.1..1.0>`: render targets and depth buffers that are not display targets
-/// (created from a console desc by CreatePlacedResource or CreateCommittedResource) are made
-/// smaller by this factor – width and height only, never below 1. A separate knob from
+/// (created from a console desc by CreatePlacedResource, CreateCommittedResource or
+/// CreateReservedResource(1); the title uses the reserved path) are made smaller by this factor –
+/// width and height only, never below 1. The name stays from when only placed was covered. A separate knob from
 /// `XCL_RT_SCALE`: the title checks its display targets and nothing else, and these hold most of the memory.
 fn rt_placed_scale() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -3540,12 +3541,16 @@ unsafe fn is_reserved(res: *mut c_void) -> bool {
 /// CreateReservedResource
 pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     census_resource("reserved", a1, false);
+    let scaled = scaled_placed_target(a1);
+    let a1 = scaled.as_ref().map_or(a1, |d| d.as_ptr() as usize);
     note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
 }
 
 /// CreateReservedResource1
 pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     census_resource("reserved1", a1, false);
+    let scaled = scaled_placed_target(a1);
+    let a1 = scaled.as_ref().map_or(a1, |d| d.as_ptr() as usize);
     note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv)
 }
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
