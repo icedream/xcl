@@ -5495,6 +5495,19 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
+    // `XCL_SKIP_BIG_DXIL=<bytes>`: the compute path's refusal, for a graphics pipeline, on its
+    // stages' DXIL added up. The driver hung on a 306 KB VS+PS pair: its compile never finished,
+    // the title waited for the pipeline at 0 FPS; a stand-in costs the pass and keeps it running.
+    if let Some(limit) = skip_big_dxil() {
+        if bytes > limit {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: graphics PSO of {} bytes of DXIL not handed to the driver (XCL_SKIP_BIG_DXIL={limit}) – stand-in", bytes);
+            }
+            super::pso_async::note_failure("graphics DXIL above XCL_SKIP_BIG_DXIL", format!("{} B DXIL, limit {limit}", bytes));
+            return None;
+        }
+    }
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
