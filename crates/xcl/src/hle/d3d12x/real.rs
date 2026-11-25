@@ -2783,6 +2783,23 @@ unsafe extern "system" fn dev_create_committed_resource_layout_x(
 /// card that cannot hold the world this is the one lever that reduces both video memory and the
 /// block the title reserves through its own allocation hook. Viewports and scissors are scaled with
 /// it, or the image would land in a corner of the target.
+/// One scale factor from an environment variable (`1.0` when unset or out of range).
+pub(super) fn env_scale(name: &str) -> f32 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s > 0.05 && *s < 1.0).unwrap_or(1.0)
+}
+
+/// `XCL_RT_SCALE` scales the display target's *desc*; `XCL_RT_SCALE_ALLOC` the size of the block the
+/// title reserves for it through its allocation hook; `XCL_RT_SCALE_VIEWPORTS` the viewports and
+/// scissors the title sets. Three separate knobs, because scaling them together cannot tell which
+/// one the title checks (it asserts at +0x247af2d within 3 ms of a scaled target).
+pub(super) fn rt_alloc_scale() -> f32 {
+    env_scale("XCL_RT_SCALE_ALLOC")
+}
+
+pub(super) fn rt_view_scale() -> f32 {
+    env_scale("XCL_RT_SCALE_VIEWPORTS")
+}
+
 pub(super) fn rt_scale() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -2815,7 +2832,15 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
         crate::xlog_warn!("D3D12.X: display target: {hr:#x}; desc {x:02x?}");
         return hr;
     }
-    let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size()) as usize;
+    let alloc = rt_alloc_scale();
+    let size = crate::hle::xg::Texture::new(&x).map_or(0usize, |t| t.size() as usize);
+    let size = if alloc < 1.0 { ((size as f32 * alloc) as usize).max(64 * 1024) } else { size };
+    if alloc < 1.0 {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_info!("D3D12.X: display target block scaled to {size:#x} bytes (XCL_RT_SCALE_ALLOC {alloc})");
+        }
+    }
     let at = if size > 0 { crate::hle::kernelx::runtime_alloc(size, crate::hle::kernelx::D3D_DISPLAY_TARGET) } else { None };
     if let Some(p) = at {
         note_title_address(*ppv as usize, p);

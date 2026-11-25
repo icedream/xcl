@@ -527,7 +527,7 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
 pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u32, v: *const D3D12_VIEWPORT) {
     // with a render-target scale the title still sets 4K viewports: scale them with the target, or
     // the image occupies a corner of the smaller resource
-    let scale = super::real::rt_scale();
+    let scale = super::real::rt_view_scale();
     let scaled: Vec<D3D12_VIEWPORT> = if !v.is_null() && scale < 1.0 {
         std::slice::from_raw_parts(v, n as usize)
             .iter()
@@ -546,7 +546,7 @@ pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u3
 
 /// console #22 RSSetScissorRects (PC #22)
 pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32, r: *const windows::Win32::Foundation::RECT) {
-    let scale = super::real::rt_scale();
+    let scale = super::real::rt_view_scale();
     let scaled: Vec<windows::Win32::Foundation::RECT> = if !r.is_null() && scale < 1.0 {
         std::slice::from_raw_parts(r, n as usize)
             .iter()
