@@ -507,8 +507,51 @@ impl TilePool {
     }
 }
 
+/// Bytes of video memory XCL's pool heaps hold, from both allocators (`sparse::take_tile` and the
+/// `Pages` here): the two are separate, and counting only one is why a cap on `sparse` alone never
+/// bound while the card ran out of memory through this one.
+pub(crate) static POOL_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `XCL_SPARSE_MAX_MB=<mib>`: the most video memory XCL's pools may take (0: no cap). Past it a
+/// tile is not mapped, which reads as zero from tiled-resources tier 2: the title loses detail
+/// instead of the device being removed.
+pub(crate) fn pool_cap_bytes() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SPARSE_MAX_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map(|mib| mib << 20))
+}
+
+/// Reserve `bytes` of the pool budget (`false`: it would exceed the cap). The caller commits the
+/// heap and must release the reservation if the driver refuses it.
+pub(crate) fn pool_budget_take(bytes: usize) -> bool {
+    let Some(cap) = pool_cap_bytes() else {
+        POOL_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        return true;
+    };
+    let now = POOL_BYTES.load(std::sync::atomic::Ordering::Acquire);
+    if now + bytes > cap {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_warn!(
+                "D3D12.X: {} MB of video-memory pools is the cap (XCL_SPARSE_MAX_MB) – further tiles stay unmapped and read as zero",
+                now >> 20
+            );
+        }
+        return false;
+    }
+    POOL_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+    true
+}
+
+pub(crate) fn pool_budget_release(bytes: usize) {
+    POOL_BYTES.fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// Allocate one 64 MiB default heap for `Pages`.
 unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+    let bytes = (POOL_PAGES as usize) * PAGE;
+    if !pool_budget_take(bytes) {
+        return None;
+    }
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -518,6 +561,7 @@ unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     };
     let mut heap: Option<ID3D12Heap> = None;
     if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+        pool_budget_release(bytes);
         crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
         return None;
     }

@@ -641,26 +641,16 @@ impl State {
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
-        // `XCL_SPARSE_MAX_MB`: stop taking pools at that much video memory rather than asking the
-        // driver for more than the card has. Past it the tiles stay unmapped, which reads as zero
-        // (tiled-resources tier 2+); the GPU keeps running instead of the device being removed,
-        // and the title loses detail rather than the whole run.
-        if let Some(cap) = sparse_max_bytes() {
-            let pool_bytes = POOL_TILES as usize * TILE;
-            let live = self.pools.iter().filter(|p| p.is_some()).count() * pool_bytes;
-            if live + pool_bytes > cap {
-                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-                    crate::xlog_warn!(
-                        "sparse windows: {} MB of pools is the cap (XCL_SPARSE_MAX_MB) – new tiles stay unmapped and read as zero",
-                        live >> 20
-                    );
-                }
-                return None;
-            }
+        // The pool budget is shared with `vram::Pages` (both commit video memory for tiles): past
+        // `XCL_SPARSE_MAX_MB` a tile stays unmapped, which reads as zero from tier 2 on, so the
+        // title loses detail instead of the device being removed.
+        let pool_bytes = POOL_TILES as usize * TILE;
+        if !super::vram::pool_budget_take(pool_bytes) {
+            return None;
         }
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
+            super::vram::pool_budget_release(pool_bytes);
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");
             return None;
         }
