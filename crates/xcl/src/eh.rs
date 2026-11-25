@@ -1227,3 +1227,39 @@ mod tests {
         }
     }
 }
+
+/// `XCL_STALL_SNAPSHOT=<seconds>`: when no frame has been presented for that long, write what the
+/// process is doing once – every thread's RIP and stack, the pipeline build counters, the device
+/// removed reason – and again only after presents resumed and stalled a second time.
+///
+/// This is the measurement that separates the ways a load can stop: a present thread waiting on a
+/// compile shows up as a thread inside a PSO build with `still building` above zero; a fence that
+/// never signals shows a thread in a wait; a lock deadlock shows a thread inside XCL's own code.
+pub fn start_stall_snapshot(seconds: u64) {
+    let _ = std::thread::Builder::new().name("xcl-stall".into()).spawn(move || {
+        let mut last = crate::hle::d3d12x::present::activity().0;
+        let mut since = std::time::Instant::now();
+        let mut dumped = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let presents = crate::hle::d3d12x::present::activity().0;
+            if presents != last {
+                last = presents;
+                since = std::time::Instant::now();
+                dumped = false;
+                continue;
+            }
+            if !dumped && since.elapsed().as_secs() >= seconds {
+                dumped = true;
+                let (built, failed, building) = crate::hle::d3d12x::pso_async::counts();
+                let (presents, executes) = crate::hle::d3d12x::present::activity();
+                crate::xlog_warn!(
+                    "stall snapshot: no frame presented for {} s (presents {presents}, submits {executes}); pipelines built {built}, failed {failed}, still building {building}",
+                    since.elapsed().as_secs()
+                );
+                crate::hle::d3d12x::real::log_device_removed();
+                dump_threads();
+            }
+        }
+    });
+}

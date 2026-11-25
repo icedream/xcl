@@ -133,6 +133,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::eh::install_crash_handler();
     crate::eh::start_probes();
     crate::hle::d3d12x::backend_before_guest();
+    // `XCL_STALL_SNAPSHOT=<seconds>`: what the process is doing when presents stop
+    if let Some(secs) = std::env::var("XCL_STALL_SNAPSHOT").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0) {
+        crate::eh::start_stall_snapshot(secs);
+    }
     HOST_MODE.store(true, Ordering::Release);
 
     // `XCL_RUN_SECONDS=n`: the title ends itself after n seconds – the GPU drained, the log and
