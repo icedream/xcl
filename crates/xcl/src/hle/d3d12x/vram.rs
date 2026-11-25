@@ -1012,31 +1012,91 @@ fn mip_prefix_tiles(total: u32, starts: &[u32], keep: u32) -> u32 {
     starts.get(keep as usize).copied().filter(|&s| s != u32::MAX).unwrap_or(total).min(total)
 }
 
+/// The reason `log_mip_cut` skips a texture, in the order checked (the first match wins):
+/// 3d, array or cube, MSAA, gpu-owned, single mip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MipSkip {
+    D3,
+    Array,
+    Msaa,
+    Gpu,
+    Single,
+}
+
+/// `log_mip_cut` skips 3D, array or cube, MSAA, gpu-owned and single-mip textures; a full-chain
+/// (`MipLevels == 0`) texture is NOT here: it is resolved from the driver's tiling call and
+/// measured.
+fn mip_skip_reason(desc: &D3D12_RESOURCE_DESC) -> Option<MipSkip> {
+    // one slice of one sample: D3D12 orders tiles by subresource, slice-major, so a prefix of an
+    // array is whole slices. GPU-owned targets carry mip chains the title renders into.
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return Some(MipSkip::D3);
+    }
+    if desc.DepthOrArraySize != 1 {
+        return Some(MipSkip::Array);
+    }
+    if desc.SampleDesc.Count != 1 {
+        return Some(MipSkip::Msaa);
+    }
+    if gpu_owned(desc.Flags.0 as u32) {
+        return Some(MipSkip::Gpu);
+    }
+    if desc.MipLevels == 1 {
+        return Some(MipSkip::Single);
+    }
+    None
+}
+
+/// The mip count of `res`: `desc_mips` when set, else the driver's answer for a full-chain
+/// (`MipLevels == 0`) texture, `NumStandardMips + NumPackedMips` in `D3D12_PACKED_MIP_INFO`,
+/// asked before the tilings array is sized because the descriptor said "full chain" not how many.
+unsafe fn resolved_mips(dev: &ID3D12Device, res: &ID3D12Resource, desc_mips: u16) -> u32 {
+    if desc_mips != 0 {
+        return desc_mips as u32;
+    }
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    dev.GetResourceTiling(res, None, Some(&mut packed), None, None, 0, std::ptr::null_mut());
+    packed.NumStandardMips as u32 + packed.NumPackedMips as u32
+}
+
 /// The tiles `mip_prefix_tiles` would keep for `res`, logged and counted for `XCL_TILE_MIPS_DRY`.
 /// The per-mip tile counts are the PC driver's, not the console's: the PC's tile shapes and packed
 /// tail are not XG's.
 unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32, keep: u32) {
-    static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_D3: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_ARR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_MSAA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_GPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SKIP_ONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TEXTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // one slice of one sample: D3D12 orders tiles by subresource, slice-major, so a prefix of an
-    // array is whole slices. GPU-owned targets carry mip chains the title renders into.
-    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels <= 1 || gpu_owned(desc.Flags.0 as u32) {
-        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(why) = mip_skip_reason(desc) {
+        let c = match why {
+            MipSkip::D3 => &SKIP_D3,
+            MipSkip::Array => &SKIP_ARR,
+            MipSkip::Msaa => &SKIP_MSAA,
+            MipSkip::Gpu => &SKIP_GPU,
+            MipSkip::Single => &SKIP_ONE,
+        };
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
+    // MipLevels == 0: full chain, where the descriptor did not say how many, so the driver's
+    // tiling call sizes the tilings array instead of desc.MipLevels
+    let full = desc.MipLevels == 0;
+    let mips = resolved_mips(dev, res, desc.MipLevels);
     let mut packed = D3D12_PACKED_MIP_INFO::default();
-    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); desc.MipLevels as usize];
-    let mut subresources = desc.MipLevels as u32;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
+    let mut subresources = mips;
     dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subresources), 0, tilings.as_mut_ptr());
     let starts: Vec<u32> = tilings[..(packed.NumStandardMips as usize).min(tilings.len())].iter().map(|t| t.StartTileIndexInOverallResource).collect();
     let kept = mip_prefix_tiles(total, &starts, keep);
     if TEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
         crate::xlog_info!(
-            "D3D12.X: tile mips: {}x{} format {} mips {} keep {keep}: tiles {total} -> {kept} ({}% kept)",
-            desc.Width, desc.Height, desc.Format.0, desc.MipLevels, 100 * kept / total.max(1)
+            "D3D12.X: tile mips: {}x{} format {} mips {mips}{} keep {keep}: tiles {total} -> {kept} ({}% kept)",
+            desc.Width, desc.Height, desc.Format.0, if full { " (full chain)" } else { "" }, 100 * kept / total.max(1)
         );
     }
     let (orig, mapped) = (
@@ -1047,9 +1107,11 @@ unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RES
         let n = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // the first cuts and then every power of two: a title makes thousands of textures
         if n < 16 || n.is_power_of_two() {
+            let rel = std::sync::atomic::Ordering::Relaxed;
+            let s = SKIP_D3.load(rel) + SKIP_ARR.load(rel) + SKIP_MSAA.load(rel) + SKIP_GPU.load(rel) + SKIP_ONE.load(rel);
             crate::xlog_info!(
-                "D3D12.X: tile mips: {n} textures cut ({} skipped), tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)",
-                SKIPPED.load(std::sync::atomic::Ordering::Relaxed), 100 * mapped / orig.max(1), (orig - mapped) >> 4
+                "D3D12.X: tile mips: {n} textures cut ({s} skipped: {} 3d, {} array or cube, {} msaa, {} gpu-owned, {} single mip), tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)",
+                SKIP_D3.load(rel), SKIP_ARR.load(rel), SKIP_MSAA.load(rel), SKIP_GPU.load(rel), SKIP_ONE.load(rel), 100 * mapped / orig.max(1), (orig - mapped) >> 4
             );
         }
     }
@@ -1611,6 +1673,43 @@ mod tests {
         assert_eq!(mip_prefix_tiles(22, &[], 1), 22);
         // a packed mip's slot takes no tiles of its own
         assert_eq!(mip_prefix_tiles(22, &[0, u32::MAX], 1), 22);
+    }
+
+    /// Each way `log_mip_cut` skips a texture selects its reason, and the first match wins; a
+    /// full-chain (`MipLevels == 0`) texture is measurable, not skipped.
+    #[test]
+    fn mip_skip_reason_reports_each_ineligible_kind() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        fn d2(mips: u16, depth: u16, samples: u32, flags: i32) -> D3D12_RESOURCE_DESC {
+            D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1024, Height: 1024, DepthOrArraySize: depth, MipLevels: mips,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: samples, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN, Flags: D3D12_RESOURCE_FLAGS(flags),
+                ..Default::default()
+            }
+        }
+        let rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0;
+        // measurable: 2d, single-slice, single-sample, not gpu-owned, with a chain (or a full one)
+        assert_eq!(mip_skip_reason(&d2(7, 1, 1, 0)), None);
+        assert_eq!(mip_skip_reason(&d2(0, 1, 1, 0)), None, "full chain is measured, not skipped");
+        // each reason is the first match
+        let d3 = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            Width: 64, Height: 64, DepthOrArraySize: 64, MipLevels: 4,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN, Flags: D3D12_RESOURCE_FLAGS(0),
+            ..Default::default()
+        };
+        assert_eq!(mip_skip_reason(&d3), Some(MipSkip::D3));
+        assert_eq!(mip_skip_reason(&d2(4, 6, 1, 0)), Some(MipSkip::Array), "array or cube");
+        assert_eq!(mip_skip_reason(&d2(4, 1, 4, 0)), Some(MipSkip::Msaa), "MSAA");
+        assert_eq!(mip_skip_reason(&d2(4, 1, 1, rt)), Some(MipSkip::Gpu), "gpu-owned");
+        assert_eq!(mip_skip_reason(&d2(1, 1, 1, 0)), Some(MipSkip::Single), "single mip");
+        // gpu-owned beats single mip when both match
+        assert_eq!(mip_skip_reason(&d2(1, 1, 1, rt)), Some(MipSkip::Gpu));
     }
 
     #[test]
