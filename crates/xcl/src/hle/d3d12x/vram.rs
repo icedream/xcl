@@ -987,6 +987,74 @@ fn canonical_va(va: usize) -> usize {
     if mapped { va } else { src }
 }
 
+/// A positive integer, or None: unset, empty, zero and anything else mean no cut.
+fn parse_tile_mips(v: &str) -> Option<u32> {
+    v.trim().parse::<u32>().ok().filter(|&n| n > 0)
+}
+
+/// `XCL_TILE_MIPS=<k>`: keep mips 0..k-1 of a tiled texture, the rest unmapped. Only the dry run
+/// (`XCL_TILE_MIPS_DRY`) reads it so far.
+fn tile_mips_keep() -> Option<u32> {
+    static V: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_TILE_MIPS").ok().as_deref().and_then(parse_tile_mips))
+}
+
+/// `XCL_TILE_MIPS_DRY=1`: log what `XCL_TILE_MIPS` would cut and map every tile as before.
+fn tile_mips_dry() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_TILE_MIPS_DRY").ok().is_some_and(|v| v.trim() == "1"))
+}
+
+/// How many of `total` tiles the first `keep` mips take: `starts[m]` is the first tile of standard
+/// mip `m`, so a `keep` past the standard mips keeps the packed tail too (`u32::MAX`: a packed
+/// mip's slot, which takes none of these).
+fn mip_prefix_tiles(total: u32, starts: &[u32], keep: u32) -> u32 {
+    starts.get(keep as usize).copied().filter(|&s| s != u32::MAX).unwrap_or(total).min(total)
+}
+
+/// The tiles `mip_prefix_tiles` would keep for `res`, logged and counted for `XCL_TILE_MIPS_DRY`.
+/// The per-mip tile counts are the PC driver's, not the console's: the PC's tile shapes and packed
+/// tail are not XG's.
+unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32, keep: u32) {
+    static SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TEXTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    // one slice of one sample: D3D12 orders tiles by subresource, slice-major, so a prefix of an
+    // array is whole slices. GPU-owned targets carry mip chains the title renders into.
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.SampleDesc.Count != 1 || desc.MipLevels <= 1 || gpu_owned(desc.Flags.0 as u32) {
+        SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); desc.MipLevels as usize];
+    let mut subresources = desc.MipLevels as u32;
+    dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subresources), 0, tilings.as_mut_ptr());
+    let starts: Vec<u32> = tilings[..(packed.NumStandardMips as usize).min(tilings.len())].iter().map(|t| t.StartTileIndexInOverallResource).collect();
+    let kept = mip_prefix_tiles(total, &starts, keep);
+    if TEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+        crate::xlog_info!(
+            "D3D12.X: tile mips: {}x{} format {} mips {} keep {keep}: tiles {total} -> {kept} ({}% kept)",
+            desc.Width, desc.Height, desc.Format.0, desc.MipLevels, 100 * kept / total.max(1)
+        );
+    }
+    let (orig, mapped) = (
+        TILES.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed) + total as u64,
+        KEPT.fetch_add(kept as u64, std::sync::atomic::Ordering::Relaxed) + kept as u64,
+    );
+    if kept < total {
+        let n = CUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // the first cuts and then every power of two: a title makes thousands of textures
+        if n < 16 || n.is_power_of_two() {
+            crate::xlog_info!(
+                "D3D12.X: tile mips: {n} textures cut ({} skipped), tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)",
+                SKIPPED.load(std::sync::atomic::Ordering::Relaxed), 100 * mapped / orig.max(1), (orig - mapped) >> 4
+            );
+        }
+    }
+}
+
 /// A texture at `va` as a reserved resource on the title's shared 64 KiB pages
 /// (`console_bytes`: its size on the console; tiles past the owned page boundaries are shared by
 /// `(va, tile_index)` so repeated placements at the same address do not leak). None: it cannot be.
@@ -1047,6 +1115,13 @@ unsafe fn place_on_pages(
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
+    // XCL_TILE_MIPS_DRY: what the cut would save. Unset, the extra tiling call and its log do not
+    // happen and `total` stays the driver's.
+    if tile_mips_dry() {
+        if let Some(keep) = tile_mips_keep() {
+            log_mip_cut(dev, res, &tiled, total, keep);
+        }
+    }
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1521,6 +1596,30 @@ mod tests {
         assert!(!console_has_packed_3d_mips(&single_mip_3d));
         let packed_2d = desc(3, 64, 64, 1, 7, 28, 0x105);
         assert!(!console_has_packed_3d_mips(&packed_2d));
+    }
+
+    /// 1024x1024 BC7 with 11 mips: mip 0 is 16 tiles, mip 1 is 4, mip 2 is 1, the tail 1.
+    #[test]
+    fn mip_prefix_tiles_cuts_at_the_start_of_mip_k() {
+        let starts = [0, 16, 20];
+        assert_eq!(mip_prefix_tiles(22, &starts, 1), 16);
+        assert_eq!(mip_prefix_tiles(22, &starts, 2), 20);
+        // past the standard mips: the packed tail stays
+        assert_eq!(mip_prefix_tiles(22, &starts, 3), 22);
+        assert_eq!(mip_prefix_tiles(22, &starts, 11), 22);
+        assert_eq!(mip_prefix_tiles(22, &starts, u32::MAX), 22);
+        assert_eq!(mip_prefix_tiles(22, &[], 1), 22);
+        // a packed mip's slot takes no tiles of its own
+        assert_eq!(mip_prefix_tiles(22, &[0, u32::MAX], 1), 22);
+    }
+
+    #[test]
+    fn parse_tile_mips_accepts_only_positive_numbers() {
+        assert_eq!(parse_tile_mips(""), None);
+        assert_eq!(parse_tile_mips("0"), None);
+        assert_eq!(parse_tile_mips("-1"), None);
+        assert_eq!(parse_tile_mips("x"), None);
+        assert_eq!(parse_tile_mips("2"), Some(2));
     }
 
     /// One call per heap: its tiles in runs, the other heaps' skipped.
