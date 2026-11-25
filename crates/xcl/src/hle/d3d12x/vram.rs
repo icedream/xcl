@@ -228,6 +228,10 @@ struct Target {
     va: usize,
     console_bytes: Option<u64>,
     total: u32,
+    /// Tiles `0..skip` are unmapped (`XCL_TILE_MIPS_SKIP`); 0: none.
+    skip: u32,
+    /// Mips `0..skip_mips` are unmapped, the `ResourceMinLODClamp` of its views; 0: none.
+    skip_mips: u32,
     mapped: bool,
     used: Vec<usize>,
     used_extra: Vec<(usize, usize)>,
@@ -721,9 +725,11 @@ impl Pages {
         dropped
     }
 
-    /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
-    /// `tiles` for the tiles of `res` from the first one of subresource `sub` on.
-    unsafe fn map(&mut self, res: &ID3D12Resource, sub: u32, tiles: &[Tile]) {
+    /// Map the tiles of `res` (`tiles[i]`: overall tile `skip + i`; `skip` is 0 unless `sub` is 0) –
+    /// one call per pool heap. `tiles` for the tiles of `res` from the first one of subresource `sub`
+    /// on. The first `skip` overall tiles stay unmapped: the first call has them as a NULL range, the
+    /// others as SKIP, which keeps what is there.
+    unsafe fn map(&mut self, res: &ID3D12Resource, sub: u32, tiles: &[Tile], skip: u32) {
         if tiles.is_empty() {
             return;
         }
@@ -740,7 +746,12 @@ impl Pages {
             self.scratch_flags.clear();
             self.scratch_offsets.clear();
             self.scratch_counts.clear();
-            let mut num_tiles = 0u32;
+            let mut num_tiles = skip;
+            if skip > 0 {
+                self.scratch_flags.push(if i == 0 { D3D12_TILE_RANGE_FLAG_NULL } else { D3D12_TILE_RANGE_FLAG_SKIP });
+                self.scratch_offsets.push(0);
+                self.scratch_counts.push(skip);
+            }
             for &(mapped, off, count) in &ranges {
                 self.scratch_flags.push(if mapped { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_SKIP });
                 self.scratch_offsets.push(off);
@@ -755,7 +766,7 @@ impl Pages {
                 Some(&coord),
                 Some(&region),
                 &self.pools[h as usize],
-                ranges.len() as u32,
+                self.scratch_flags.len() as u32,
                 Some(self.scratch_flags.as_ptr()),
                 Some(self.scratch_offsets.as_ptr()),
                 Some(self.scratch_counts.as_ptr()),
@@ -824,15 +835,17 @@ impl Pages {
         }
     }
 
-    /// Acquire/share all `total` tiles for `res` at `va` and map them on the `Pages` queue.
-    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        self.bind_range(dev, res, va, console_bytes, total, 0, 0..total as usize)
+    /// Acquire/share tiles `skip..total` for `res` at `va` and map them on the `Pages` queue; the
+    /// first `skip` tiles are left unmapped and take no page of the title's range.
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, skip: u32) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range(dev, res, va, console_bytes, total, 0, skip, skip as usize..total as usize)
     }
 
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
+    /// `skip`: overall tiles `0..skip` left unmapped (`XCL_TILE_MIPS_SKIP`), only with `sub` 0.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
-        let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
+    unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, skip: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        let (first, own) = (total > skip).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
 
@@ -898,7 +911,7 @@ impl Pages {
             };
             tiles.push(tile);
         }
-        self.map(res, sub, &tiles);
+        self.map(res, sub, &tiles, skip);
         Some((used, used_extra))
     }
 }
@@ -1074,6 +1087,88 @@ unsafe fn resolved_mips(dev: &ID3D12Device, res: &ID3D12Resource, desc_mips: u16
     packed.NumStandardMips as u32 + packed.NumPackedMips as u32
 }
 
+/// The mip count of `res` and the first tile of each of its standard mips, from the driver's
+/// tiling call.
+unsafe fn mip_tile_starts(dev: &ID3D12Device, res: &ID3D12Resource, desc_mips: u16) -> (u32, Vec<u32>) {
+    let mips = resolved_mips(dev, res, desc_mips);
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
+    let mut subresources = mips;
+    dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subresources), 0, tilings.as_mut_ptr());
+    let starts = tilings[..(packed.NumStandardMips as usize).min(tilings.len())].iter().map(|t| t.StartTileIndexInOverallResource).collect();
+    (mips, starts)
+}
+
+/// What `XCL_TILE_MIPS` (keep mips 0..keep-1) and `XCL_TILE_MIPS_SKIP` (leave mips 0..skip-1
+/// unmapped) do to one texture of `total` tiles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MipCutPlan {
+    /// Every tile stays mapped.
+    None,
+    /// No mip is left: both variables together keep nothing (skip at or past keep, or skip past the
+    /// standard mips), so the texture is not cut.
+    Empty,
+    /// Tiles `skip_tiles..total` are mapped; mips `0..skip_mips` are unmapped.
+    Cut { total: u32, skip_tiles: u32, skip_mips: u32 },
+}
+
+/// Both cuts at once keep the mips `skip..keep`: the tiles from the start of mip `skip` to the start
+/// of mip `keep`.
+fn plan_mip_cut(total: u32, starts: &[u32], keep: Option<u32>, skip: Option<u32>) -> MipCutPlan {
+    let end = keep.map_or(total, |keep| mip_prefix_tiles(total, starts, keep));
+    let begin = skip.map_or(0, |skip| mip_skip_prefix_tiles(total, starts, skip));
+    if begin >= end {
+        return MipCutPlan::Empty;
+    }
+    if begin == 0 && end == total {
+        return MipCutPlan::None;
+    }
+    MipCutPlan::Cut { total: end, skip_tiles: begin, skip_mips: if begin > 0 { skip.unwrap_or(0) } else { 0 } }
+}
+
+/// `XCL_TILE_MIPS` and `XCL_TILE_MIPS_SKIP` applied to a texture: `(total, skip tiles, skip mips)`
+/// to bind, or the unchanged `(total, 0, 0)` for an ineligible texture, one nothing is left of, or one
+/// with no mip to cut. Counted and logged like `log_mip_cut`, by what was actually cut.
+unsafe fn apply_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC, total: u32, keep: Option<u32>, skip: Option<u32>) -> (u32, u32, u32) {
+    static CUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static TILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static MAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    if mip_skip_reason(desc).is_some() {
+        return (total, 0, 0);
+    }
+    let (mips, starts) = mip_tile_starts(dev, res, desc.MipLevels);
+    match plan_mip_cut(total, &starts, keep, skip) {
+        MipCutPlan::None => (total, 0, 0),
+        MipCutPlan::Empty => {
+            let n = EMPTY.fetch_add(1, rel) + 1;
+            if n < 4 || n.is_power_of_two() {
+                crate::xlog_warn!(
+                    "D3D12.X: tile mips: keep {keep:?} skip {skip:?} leave no mip of a {}x{} texture with {mips} mips ({n} so far) – not cut",
+                    desc.Width, desc.Height
+                );
+            }
+            (total, 0, 0)
+        }
+        MipCutPlan::Cut { total: end, skip_tiles, skip_mips } => {
+            let orig = TILES.fetch_add(total as u64, rel) + total as u64;
+            let mapped = MAPPED.fetch_add((end - skip_tiles) as u64, rel) + (end - skip_tiles) as u64;
+            let n = CUT.fetch_add(1, rel) + 1;
+            // the first cuts and then every power of two: a title makes thousands of textures
+            if n < 16 || n.is_power_of_two() {
+                crate::xlog_info!(
+                    "D3D12.X: tile mips cut: keep {keep:?} skip {skip:?}: {n} textures cut ({} left whole), tiles {orig} -> {mapped} ({}% kept, {} MiB not mapped)",
+                    EMPTY.load(rel),
+                    100 * mapped / orig.max(1),
+                    (orig - mapped) >> 4
+                );
+            }
+            (end, skip_tiles, skip_mips)
+        }
+    }
+}
+
 /// The tiles `mip_prefix_tiles` would keep and `mip_skip_prefix_tiles` would free for `res`, logged
 /// and counted for `XCL_TILE_MIPS_DRY`; both cuts share the eligibility and the counters' framing so
 /// one run reports them side by side. The per-mip tile counts are the PC driver's, not the console's:
@@ -1104,12 +1199,7 @@ unsafe fn log_mip_cut(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RES
     // MipLevels == 0: full chain, where the descriptor did not say how many, so the driver's
     // tiling call sizes the tilings array instead of desc.MipLevels
     let full = desc.MipLevels == 0;
-    let mips = resolved_mips(dev, res, desc.MipLevels);
-    let mut packed = D3D12_PACKED_MIP_INFO::default();
-    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
-    let mut subresources = mips;
-    dev.GetResourceTiling(res, None, Some(&mut packed), None, Some(&mut subresources), 0, tilings.as_mut_ptr());
-    let starts: Vec<u32> = tilings[..(packed.NumStandardMips as usize).min(tilings.len())].iter().map(|t| t.StartTileIndexInOverallResource).collect();
+    let (mips, starts) = mip_tile_starts(dev, res, desc.MipLevels);
     let kept = keep.map(|keep| mip_prefix_tiles(total, &starts, keep));
     let freed = skip.map(|skip| mip_skip_prefix_tiles(total, &starts, skip));
     if TEXTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
@@ -1227,10 +1317,14 @@ unsafe fn place_on_pages(
     };
     // XCL_TILE_MIPS_DRY: what the cut would save. Unset, the extra tiling call and its log do not
     // happen and `total` stays the driver's.
-    if tile_mips_dry() {
-        let (keep, skip) = (tile_mips_keep(), tile_mips_skip());
-        if keep.is_some() || skip.is_some() {
+    let (keep, skip) = (tile_mips_keep(), tile_mips_skip());
+    let (mut total, mut skip_tiles, mut skip_mips) = (total, 0, 0);
+    // (lazy levels place the tiles per level themselves: no cut on top of that)
+    if keep.is_some() || skip.is_some() {
+        if tile_mips_dry() {
             log_mip_cut(dev, res, &tiled, total, keep, skip);
+        } else if levels.is_none() {
+            (total, skip_tiles, skip_mips) = apply_mip_cut(dev, res, &tiled, total, keep, skip);
         }
     }
     let bound = {
@@ -1240,10 +1334,10 @@ unsafe fn place_on_pages(
                 // nothing mapped yet: a level gets its pages with its first texels (`map_levels`)
                 LEVEL_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 LEVEL_STATS[1].fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, skip: 0, skip_mips: 0, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels });
                 true
-            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) {
-                pages.targets.insert(raw as usize, Target { va, console_bytes, total, mapped: true, used, used_extra, levels: None });
+            } else if let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total, skip_tiles) {
+                pages.targets.insert(raw as usize, Target { va, console_bytes, total, skip: skip_tiles, skip_mips, mapped: true, used, used_extra, levels: None });
                 true
             } else {
                 false
@@ -1296,7 +1390,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
     let key = res.as_raw() as usize;
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
-    let Some((va, console_bytes, total, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.mapped)) else {
+    let Some((va, console_bytes, total, skip, mapped)) = pages.targets.get(&key).map(|t| (t.va, t.console_bytes, t.total, t.skip, t.mapped)) else {
         return false;
     };
     if mapped {
@@ -1307,7 +1401,7 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapped = true;
         return true;
     }
-    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total) else {
+    let Some((used, used_extra)) = pages.bind(&dev, res, va, console_bytes, total, skip) else {
         return false;
     };
     if let Some(t) = pages.targets.get_mut(&key) {
@@ -1316,6 +1410,41 @@ pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
         t.mapped = true;
     }
     true
+}
+
+/// The `ResourceMinLODClamp` for views of the resource at `key`: the mips `XCL_TILE_MIPS_SKIP` left
+/// unmapped, so a shader reads the first mapped mip instead of zeros. None: it was not cut that way.
+fn min_lod_clamp(targets: &std::collections::HashMap<usize, Target>, key: usize) -> Option<f32> {
+    targets.get(&key).filter(|t| t.skip_mips > 0).map(|t| t.skip_mips as f32)
+}
+
+/// The shader view `v` (None: the resource's default one) of the title resource `key` with
+/// `ResourceMinLODClamp` raised to its cut, for a resource `XCL_TILE_MIPS_SKIP` cut – None: not cut,
+/// or a view of another dimension, which stays as it is.
+pub(super) fn clamped_srv(key: usize, rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    let clamp = {
+        let g = PAGES.lock().unwrap();
+        g.values().flatten().find_map(|pages| min_lod_clamp(&pages.targets, key))?
+    };
+    let mut out = match v {
+        Some(v) => *v,
+        None => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: rd.Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() } },
+        },
+    };
+    // SAFETY: each branch reads and writes the union field named by `ViewDimension`.
+    unsafe {
+        let c = match out.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => &mut out.Anonymous.Texture2D.ResourceMinLODClamp,
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => &mut out.Anonymous.Texture2DArray.ResourceMinLODClamp,
+            _ => return None,
+        };
+        *c = c.max(clamp);
+    }
+    Some(out)
 }
 
 /// A resource released: its pages are no longer its.
@@ -1565,7 +1694,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, 0, first as usize..(first + n) as usize) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1777,6 +1906,44 @@ mod tests {
         assert_eq!(mip_skip_reason(&d2(1, 1, 1, 0)), Some(MipSkip::Single), "single mip");
         // gpu-owned beats single mip when both match
         assert_eq!(mip_skip_reason(&d2(1, 1, 1, rt)), Some(MipSkip::Gpu));
+    }
+
+    /// Both cuts together keep the mips skip..keep; nothing left is no cut. The 1024x1024 BC7 data of
+    /// `mip_prefix_tiles_cuts_at_the_start_of_mip_k`: starts [0, 16, 20], tail tile, 22 tiles.
+    #[test]
+    fn plan_mip_cut_intersects_keep_and_skip() {
+        let starts = [0, 16, 20];
+        let cut = |total, skip_tiles, skip_mips| MipCutPlan::Cut { total, skip_tiles, skip_mips };
+        assert_eq!(plan_mip_cut(22, &starts, None, None), MipCutPlan::None);
+        assert_eq!(plan_mip_cut(22, &starts, Some(2), None), cut(20, 0, 0));
+        assert_eq!(plan_mip_cut(22, &starts, Some(3), None), MipCutPlan::None, "the tail is kept");
+        assert_eq!(plan_mip_cut(22, &starts, None, Some(1)), cut(22, 16, 1));
+        assert_eq!(plan_mip_cut(22, &starts, None, Some(2)), cut(22, 20, 2));
+        // mips 1..2 of keep 3 skip 1
+        assert_eq!(plan_mip_cut(22, &starts, Some(3), Some(1)), cut(22, 16, 1));
+        // keep 2 skip 1: only mip 1, tiles 16..20
+        assert_eq!(plan_mip_cut(22, &starts, Some(2), Some(1)), cut(20, 16, 1));
+        // empty: skip at or past keep, or past the standard mips
+        assert_eq!(plan_mip_cut(22, &starts, Some(1), Some(1)), MipCutPlan::Empty);
+        assert_eq!(plan_mip_cut(22, &starts, Some(1), Some(2)), MipCutPlan::Empty);
+        assert_eq!(plan_mip_cut(22, &starts, None, Some(3)), MipCutPlan::Empty);
+        assert_eq!(plan_mip_cut(22, &starts, None, Some(11)), MipCutPlan::Empty);
+        assert_eq!(plan_mip_cut(22, &[], None, Some(1)), MipCutPlan::Empty);
+    }
+
+    /// Views clamp to the mips the skip cut left unmapped; an uncut or keep-only target has none.
+    /// The view rewrite itself (`clamped_srv`) needs the global `PAGES`, a device queue to fill.
+    #[test]
+    fn min_lod_clamp_answers_only_for_skip_cut_targets() {
+        let target = |skip, skip_mips| Target { va: 0, console_bytes: None, total: 22, skip, skip_mips, mapped: true, used: Vec::new(), used_extra: Vec::new(), levels: None };
+        let mut targets = std::collections::HashMap::new();
+        targets.insert(1usize, target(16, 1));
+        targets.insert(2usize, target(20, 2));
+        targets.insert(3usize, target(0, 0));
+        assert_eq!(min_lod_clamp(&targets, 1), Some(1.0));
+        assert_eq!(min_lod_clamp(&targets, 2), Some(2.0));
+        assert_eq!(min_lod_clamp(&targets, 3), None, "keep-only or uncut");
+        assert_eq!(min_lod_clamp(&targets, 4), None, "not a placed texture");
     }
 
     #[test]
