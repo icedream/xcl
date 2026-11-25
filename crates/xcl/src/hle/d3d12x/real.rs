@@ -2859,6 +2859,47 @@ unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, st
     hr
 }
 
+/// `XCL_RT_SCALE_PLACED=<0.1..1.0>`: render targets and depth buffers that are not display targets
+/// (created from a console desc by CreatePlacedResource or CreateCommittedResource) are made
+/// smaller by this factor – width and height only, never below 1. A separate knob from
+/// `XCL_RT_SCALE`: the title checks its display targets and nothing else, and these hold most of the memory.
+fn rt_placed_scale() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| env_scale("XCL_RT_SCALE_PLACED"))
+}
+
+/// the console desc of a 2D render target or depth buffer with its width and height scaled by
+/// `XCL_RT_SCALE_PLACED`; None: not one, or the scale is not set. Logged once per original size.
+unsafe fn scaled_placed_target(desc: usize) -> Option<[u8; 0x38]> {
+    let scale = rt_placed_scale();
+    if scale >= 1.0 || desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
+        return None;
+    }
+    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let flags = u32::from_le_bytes(x[0x30..0x34].try_into().unwrap());
+    let target = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 as u32 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32;
+    if u32::from_le_bytes(x[0..4].try_into().unwrap()) != D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32 || flags & target == 0 {
+        return None;
+    }
+    let w = u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()).max(1);
+    let h = u32::from_le_bytes(x[0x18..0x1C].try_into().unwrap()).max(1);
+    let nw = ((w as f32 * scale) as u64).clamp(1, w);
+    let nh = ((h as f32 * scale) as u32).clamp(1, h);
+    if (nw, nh) == (w, h) {
+        return None;
+    }
+    x[0x10..0x18].copy_from_slice(&nw.to_le_bytes());
+    x[0x18..0x1C].copy_from_slice(&nh.to_le_bytes());
+    static SEEN: std::sync::Mutex<Vec<(u64, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    let format = u32::from_le_bytes(x[0x20..0x24].try_into().unwrap());
+    let mut seen = SEEN.lock().unwrap();
+    if !seen.contains(&(w, h, flags)) {
+        seen.push((w, h, flags));
+        crate::xlog_info!("D3D12.X: render target scaled {w}x{h} -> {nw}x{nh} (format {format}, flags {flags:#x}, XCL_RT_SCALE_PLACED {scale})");
+    }
+    Some(x)
+}
+
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2878,6 +2919,8 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
     let mut pc_desc = [0u8; 56];
+    let scaled = if flags as u32 & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 == 0 { scaled_placed_target(desc) } else { None };
+    let desc = scaled.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     let console_desc = desc;
     let mut desc = desc;
     if desc != 0 {
@@ -3304,6 +3347,8 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     // the clear value in the PC's format of the resource (D3D12 wants the two to match)
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
+    let scaled = scaled_placed_target(desc);
+    let desc = scaled.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
     if desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
         let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
