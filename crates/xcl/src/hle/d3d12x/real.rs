@@ -2778,8 +2778,37 @@ unsafe extern "system" fn dev_create_committed_resource_layout_x(
 /// A display target: its console memory comes from the title's allocation hook, as the console
 /// runtime's does (a retail game gives its back buffers one block and asserts that it is used up); on the
 /// PC it is a resource of its own.
+/// `XCL_RT_SCALE=<0.1..1.0>`: render targets and the viewports that address them are made smaller
+/// by this factor. The title picks 4K on its own (nothing in `XDisplay` reports a mode), and on a
+/// card that cannot hold the world this is the one lever that reduces both video memory and the
+/// block the title reserves through its own allocation hook. Viewports and scissors are scaled with
+/// it, or the image would land in a corner of the target.
+pub(super) fn rt_scale() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let s = std::env::var("XCL_RT_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|s| *s > 0.05 && *s < 1.0);
+        if let Some(s) = s {
+            crate::xlog_info!("D3D12.X: render-target scale {s} (XCL_RT_SCALE) – display targets and viewports are scaled");
+        }
+        s.unwrap_or(1.0)
+    })
+}
+
 unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let scale = rt_scale();
+    if scale < 1.0 {
+        let w = u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()).max(1);
+        let h = u32::from_le_bytes(x[0x18..0x1C].try_into().unwrap()).max(1);
+        let nw = ((w as f32 * scale) as u64).max(16);
+        let nh = ((h as f32 * scale) as u32).max(16);
+        x[0x10..0x18].copy_from_slice(&nw.to_le_bytes());
+        x[0x18..0x1C].copy_from_slice(&nh.to_le_bytes());
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+            crate::xlog_info!("D3D12.X: display target scaled {w}x{h} -> {nw}x{nh} (XCL_RT_SCALE {scale})");
+        }
+    }
     let d = super::device_x::pc_resource_desc(&x);
     let hr = dev_create_committed_resource(this, props, 0, d.as_ptr() as usize, state, clear, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {

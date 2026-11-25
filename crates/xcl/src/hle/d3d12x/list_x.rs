@@ -525,20 +525,47 @@ pub(super) unsafe extern "system" fn ia_set_topology_x(this: *mut c_void, t: u32
 
 /// console #21 RSSetViewports (PC #21)
 pub(super) unsafe extern "system" fn rs_set_viewports_x(this: *mut c_void, n: u32, v: *const D3D12_VIEWPORT) {
+    // with a render-target scale the title still sets 4K viewports: scale them with the target, or
+    // the image occupies a corner of the smaller resource
+    let scale = super::real::rt_scale();
+    let scaled: Vec<D3D12_VIEWPORT> = if !v.is_null() && scale < 1.0 {
+        std::slice::from_raw_parts(v, n as usize)
+            .iter()
+            .map(|p| D3D12_VIEWPORT { TopLeftX: p.TopLeftX * scale, TopLeftY: p.TopLeftY * scale, Width: p.Width * scale, Height: p.Height * scale, ..*p })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !v.is_null() {
-        let vs = std::slice::from_raw_parts(v, n as usize).to_vec();
+        let vs = if scaled.is_empty() { std::slice::from_raw_parts(v, n as usize).to_vec() } else { scaled.clone() };
         with_bindings(this, |b| b.viewports = vs);
     }
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS)(this, n, v)
+    let ptr = if scaled.is_empty() { v } else { scaled.as_ptr() };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_VIEWPORT)>(this, PC_RS_SET_VIEWPORTS)(this, n, ptr)
 }
 
 /// console #22 RSSetScissorRects (PC #22)
 pub(super) unsafe extern "system" fn rs_set_scissors_x(this: *mut c_void, n: u32, r: *const windows::Win32::Foundation::RECT) {
+    let scale = super::real::rt_scale();
+    let scaled: Vec<windows::Win32::Foundation::RECT> = if !r.is_null() && scale < 1.0 {
+        std::slice::from_raw_parts(r, n as usize)
+            .iter()
+            .map(|s| windows::Win32::Foundation::RECT {
+                left: (s.left as f32 * scale) as i32,
+                top: (s.top as f32 * scale) as i32,
+                right: (s.right as f32 * scale) as i32,
+                bottom: (s.bottom as f32 * scale) as i32,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !r.is_null() {
-        let rs = std::slice::from_raw_parts(r, n as usize).to_vec();
+        let rs = if scaled.is_empty() { std::slice::from_raw_parts(r, n as usize).to_vec() } else { scaled.clone() };
         with_bindings(this, |b| b.scissors = rs);
     }
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, n, r)
+    let ptr = if scaled.is_empty() { r } else { scaled.as_ptr() };
+    pc::<unsafe extern "system" fn(*mut c_void, u32, *const windows::Win32::Foundation::RECT)>(this, PC_RS_SET_SCISSOR_RECTS)(this, n, ptr)
 }
 
 /// console #23 OMSetBlendFactor (PC #23)
