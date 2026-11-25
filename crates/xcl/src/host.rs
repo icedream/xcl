@@ -157,6 +157,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         }
     };
     unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
+    // `XCL_PATCH_WATCHDOG=1`: do not let the title give up on a load this machine needs minutes for
+    unsafe { crate::loader::patch_watchdog(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");

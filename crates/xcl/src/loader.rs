@@ -523,3 +523,38 @@ mod tests {
         }
     }
 }
+
+/// `XCL_PATCH_WATCHDOG=1`: the title ends its own process when no frame has been presented for
+/// a few minutes (a null store with a tag value, `+0x23cf683` and `+0x2215c35` in this build).
+/// The world load on a slow card takes longer than that: hundreds of driver compiles of a few
+/// seconds to half a minute each. With this set, those two stores are replaced by NOPs, so the
+/// title keeps loading instead of giving up. The bytes are checked first; anything unexpected is
+/// left alone and logged.
+pub unsafe fn patch_watchdog(m: &Arc<crate::modules::MappedModule>) {
+    if std::env::var_os("XCL_PATCH_WATCHDOG").is_none() {
+        return;
+    }
+    // a null store with an optional tag: `C7 04 25 00 00 00 00 <imm32>` (11 bytes)
+    for (rva, why) in [(0x23cf683usize, "stall watchdog (tagged)"), (0x2215c35usize, "bring-up reporter")] {
+        let at = m.base + rva;
+        let bytes = std::slice::from_raw_parts(at as *const u8, 11);
+        let null_store = bytes[0] == 0xC7 && bytes[1] == 0x04 && bytes[2] == 0x25 && bytes[3..7].iter().all(|&b| b == 0);
+        if !null_store {
+            crate::xlog_warn!("watchdog patch: {:#x} does not look like a null store ({bytes:02x?}) – left alone", at);
+            continue;
+        }
+        // the title's .text is mapped read-only: change the protection around the write
+        use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+        let mut old = 0u32;
+        if VirtualProtect(at as *const std::ffi::c_void, 11, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            crate::xlog_warn!("watchdog patch: {at:#x} is not writable – left alone");
+            continue;
+        }
+        for i in 0..11 {
+            std::ptr::write_volatile((at + i) as *mut u8, 0x90);
+        }
+        let mut restored = 0u32;
+        let _ = VirtualProtect(at as *const std::ffi::c_void, 11, old, &mut restored);
+        crate::xlog_info!("watchdog patch: {why} at {:#x} disabled (XCL_PATCH_WATCHDOG)", at);
+    }
+}

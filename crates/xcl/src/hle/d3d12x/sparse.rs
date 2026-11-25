@@ -607,6 +607,12 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     }
 }
 
+/// `XCL_SPARSE_MAX_MB=<mib>`: the most video memory XCL's tile pools may take.
+fn sparse_max_bytes() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SPARSE_MAX_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map(|mib| mib << 20))
+}
+
 impl State {
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
@@ -635,6 +641,24 @@ impl State {
             Alignment: 0,
             Flags: D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES,
         };
+        // `XCL_SPARSE_MAX_MB`: stop taking pools at that much video memory rather than asking the
+        // driver for more than the card has. Past it the tiles stay unmapped, which reads as zero
+        // (tiled-resources tier 2+); the GPU keeps running instead of the device being removed,
+        // and the title loses detail rather than the whole run.
+        if let Some(cap) = sparse_max_bytes() {
+            let pool_bytes = POOL_TILES as usize * TILE;
+            let live = self.pools.iter().filter(|p| p.is_some()).count() * pool_bytes;
+            if live + pool_bytes > cap {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                    crate::xlog_warn!(
+                        "sparse windows: {} MB of pools is the cap (XCL_SPARSE_MAX_MB) – new tiles stay unmapped and read as zero",
+                        live >> 20
+                    );
+                }
+                return None;
+            }
+        }
         let mut heap: Option<ID3D12Heap> = None;
         if let Err(e) = super::title_textures::own_work(|| self.dev.CreateHeap(&desc, &mut heap)) {
             crate::xlog_warn!("sparse windows: no video memory for more tiles ({e})");

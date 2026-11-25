@@ -4074,6 +4074,12 @@ fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() 
     driver_compile_identified(kind, bytes, gate, None, build).0
 }
 
+/// `XCL_SKIP_BIG_DXIL=<bytes>`: do not hand the driver a compute program above that much DXIL.
+fn skip_big_dxil() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SKIP_BIG_DXIL").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0))
+}
+
 /// `XCL_PSO_TRACE=1`: every driver compile is logged, not only huge ones.
 fn pso_trace() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4374,6 +4380,19 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
     };
     let dxil = compiled.dxil;
+    // `XCL_SKIP_BIG_DXIL=<bytes>`: refuse to hand the driver a program above that size. Its own
+    // compiler crashes on this title's ~1 MB compute programs (amdxc64, fault at 0xa8, with
+    // D3DSCache.dll in the stack), which takes the whole process down; a stand-in costs the pass
+    // and keeps the title running.
+    if let Some(limit) = skip_big_dxil() {
+        if dxil.len() > limit {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 8 {
+                crate::xlog_warn!("D3D12.X: compute PSO of {} bytes of DXIL not handed to the driver (XCL_SKIP_BIG_DXIL={limit}) – stand-in", dxil.len());
+            }
+            return Some(Err(()));
+        }
+    }
     // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
     // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
     // whose DXIL is missing – the title's loading does not wait for it, its first bind does
