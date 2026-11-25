@@ -613,6 +613,20 @@ fn sparse_max_bytes() -> Option<usize> {
     *V.get_or_init(|| std::env::var("XCL_SPARSE_MAX_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).map(|mib| mib << 20))
 }
 
+/// `XCL_SPARSE_TITLE_GATE=0`: the sparse upload queue does not wait for the title's last
+/// submission before it writes tiles or remaps them; any other value (or unset) keeps the wait.
+fn title_gate_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SPARSE_TITLE_GATE").ok().as_deref() == Some("0"))
+}
+
+/// `XCL_SPARSE_SLOW_MS=<ms>`: log when a sparse-queue D3D12 call takes at least this many
+/// milliseconds; unset: off.
+fn slow_ms() -> Option<u128> {
+    static V: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_SPARSE_SLOW_MS").ok().and_then(|v| v.trim().parse::<u128>().ok()))
+}
+
 impl State {
     #[inline]
     fn window_index(&self, a: usize) -> Option<usize> {
@@ -739,6 +753,8 @@ impl State {
                 i += run as usize;
             }
             gate_on_title(self);
+            let slow = slow_ms();
+            let t0 = slow.map(|_| std::time::Instant::now());
             self.queue.UpdateTileMappings(
                 res,
                 coords.len() as u32,
@@ -751,6 +767,12 @@ impl State {
                 Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
+            if let (Some(ms), Some(t0)) = (slow, t0) {
+                let elapsed = t0.elapsed().as_millis();
+                if elapsed >= ms {
+                    log_slow(self, "UpdateTileMappings", elapsed);
+                }
+            }
         }
     }
 
@@ -778,6 +800,8 @@ impl State {
             i += run as usize;
         }
         gate_on_title(self);
+        let slow = slow_ms();
+        let t0 = slow.map(|_| std::time::Instant::now());
         self.queue.UpdateTileMappings(
             res,
             coords.len() as u32,
@@ -790,6 +814,12 @@ impl State {
             Some(counts.as_ptr()),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        if let (Some(ms), Some(t0)) = (slow, t0) {
+            let elapsed = t0.elapsed().as_millis();
+            if elapsed >= ms {
+                log_slow(self, "unmap tiles", elapsed);
+            }
+        }
     }
 
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
@@ -904,9 +934,17 @@ impl State {
         let closed = self.slots[idx].list.Close().is_ok();
         if closed {
             if let Ok(l) = self.slots[idx].list.cast::<ID3D12CommandList>() {
+                let slow = slow_ms();
+                let t0 = slow.map(|_| std::time::Instant::now());
                 super::title_textures::own_work(|| {
                     self.queue.ExecuteCommandLists(&[Some(l)]);
                 });
+                if let (Some(ms), Some(t0)) = (slow, t0) {
+                    let elapsed = t0.elapsed().as_millis();
+                    if elapsed >= ms {
+                        log_slow(self, "ExecuteCommandLists", elapsed);
+                    }
+                }
             }
         }
         self.signal();
@@ -1602,10 +1640,29 @@ pub unsafe fn after_title_execute(title_queue: &ID3D12CommandQueue) {
 /// wait is idempotent (waiting on a value that already completed costs a submit-time check), which
 /// keeps this callable from the `&self` mapping paths.
 unsafe fn gate_on_title(s: &State) {
+    if title_gate_disabled() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            crate::xlog_info!("sparse: title gate disabled (XCL_SPARSE_TITLE_GATE=0), q1 does not wait for the title's queue");
+        });
+        return;
+    }
     let (Some(f), v) = (s.title_fence.as_ref(), s.title_value) else { return };
     if v > 0 {
         let _ = s.queue.Wait(f, v);
     }
+}
+
+/// log a sparse-queue D3D12 call that took at least `slow_ms()` – the upload/title fence cycle
+unsafe fn log_slow(s: &State, call: &str, ms: u128) {
+    let c = s.fence.GetCompletedValue();
+    let v = s.value;
+    let tc = s.title_fence.as_ref().map_or(0, |f| f.GetCompletedValue());
+    let tv = s.title_value;
+    let tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+    crate::xlog_info!(
+        "sparse: q1 {call} took {ms} ms on thread {tid} (q1 completed {c:#x} / value {v:#x}; title fence completed {tc:#x} / title_value {tv:#x})"
+    );
 }
 
 /// Before the title's ExecuteCommandLists on `queue`: the pages the CPU wrote (`dirty`, 4 KiB
