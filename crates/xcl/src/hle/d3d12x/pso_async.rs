@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
-    /// the build, until a worker – or a bind that cannot wait for the queue – takes it
+    /// the build, until a worker takes it (`released` drops it when the stand-in went first)
     job: Mutex<Option<Job>>,
     /// the build went to the workers (a lazy one goes on its first `resolve`)
     sent: std::sync::atomic::AtomicBool,
@@ -377,7 +377,7 @@ fn build_queued(p: &Arc<Pending>) {
         drop_unstarted_job(p);
         return;
     }
-    // (None: a bind took it and builds it itself)
+    // (None: another worker took it, or `released` dropped it as an orphan)
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         build(p, job, false);
@@ -664,9 +664,9 @@ mod used_tests {
             let _ = finish.recv();
             0x5252
         }), 0);
-        let bind = std::thread::spawn(move || resolve_wait_for(standin, None));
+        let bind = std::thread::spawn(move || resolve_wait_for(standin, NO_LIMIT));
         building.recv_timeout(std::time::Duration::from_secs(10)).expect("the pipeline is being built");
-        // (built in the bind, or by a worker with the bind about to wait for it)
+        // (a worker builds it: the bind only waits)
         let t = std::time::Instant::now();
         while !title_held() && t.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -689,9 +689,9 @@ mod used_tests {
             shared(s, driver);
             assert_eq!(entry(s).unwrap().stand(s), driver);
         }
-        assert_eq!(resolve_wait_for(fails, None), driver, "its build failed");
+        assert_eq!(resolve_wait_for(fails, NO_LIMIT), driver, "its build failed");
         assert_eq!(resolve(fails), driver);
-        assert_eq!(resolve_wait_for(builds, None), 0x1234);
+        assert_eq!(resolve_wait_for(builds, NO_LIMIT), 0x1234);
         assert_eq!(resolve_for_bind(builds), 0x1234);
         // (0x1234 is no pipeline: taken, not released)
         assert_eq!((released(fails), released(builds)), (0, 0x1234));
@@ -715,7 +715,7 @@ mod used_tests {
         // (on a thread: a bind that waits would wait for `go`, below)
         let (bound_tx, bound) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = bound_tx.send((resolve_wait_for(spared, None), resolve_wait_for(spared, None)));
+            let _ = bound_tx.send((resolve_wait_for(spared, NO_LIMIT), resolve_wait_for(spared, NO_LIMIT)));
         });
         let binds = bound.recv_timeout(std::time::Duration::from_secs(5));
         if binds.is_err() {
@@ -729,13 +729,13 @@ mod used_tests {
         while is_pending(spared) && start.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(resolve_wait_for(spared, None), 0x5A5A, "built by a worker");
+        assert_eq!(resolve_wait_for(spared, NO_LIMIT), 0x5A5A, "built by a worker");
         // the same build without the mark: the bind waits for it
         submit_lazy(waited, true, Box::new(|| {
             std::thread::sleep(std::time::Duration::from_millis(100));
             0x5B5B
         }), 0);
-        assert_eq!(resolve_wait_for(waited, None), 0x5B5B);
+        assert_eq!(resolve_wait_for(waited, NO_LIMIT), 0x5B5B);
         let _ = released(spared);
         let _ = released(waited);
     }
@@ -777,7 +777,7 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(600));
             0x5151
         }));
-        let budget = Some(std::time::Duration::from_millis(30));
+        let budget = std::time::Duration::from_millis(30);
         let t = std::time::Instant::now();
         assert_eq!(resolve_wait_for(standin, budget), standin, "not built within the budget: the stand-in");
         assert!(t.elapsed() < std::time::Duration::from_millis(400), "waited {:?}", t.elapsed());
@@ -789,6 +789,38 @@ mod used_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(resolve_wait_for(standin, budget), 0x5151, "built by a worker");
+        let _ = released(standin);
+    }
+
+    /// With `XCL_PSO_WAIT_MS` unset a bind waits `DEFAULT_WAIT_MS` and no longer, and the build
+    /// is never its own: a title's thread does not run the DXC translation or the driver compile
+    /// (those are gated only on `xcl-pso*` threads, `real::driver_compile_identified`).
+    #[test]
+    fn a_bind_waits_the_default_budget_and_never_builds_itself() {
+        if std::env::var_os("XCL_PSO_WAIT_MS").is_some() {
+            return; // (a run with the knob set is not the default this test is about)
+        }
+        assert_eq!(wait_budget(), std::time::Duration::from_millis(DEFAULT_WAIT_MS), "an unset knob is the default, not forever");
+        let standin = 0x7E57_B0FEusize;
+        let (go, finish) = mpsc::channel::<()>();
+        let (where_tx, built_on) = mpsc::channel();
+        submit_lazy(standin, true, Box::new(move || {
+            let _ = where_tx.send(std::thread::current().name().unwrap_or_default().to_string());
+            let _ = finish.recv();
+            0x5C5C
+        }), 0);
+        let t = std::time::Instant::now();
+        assert_eq!(resolve_wait(standin), standin, "past the default budget: the stand-in");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(DEFAULT_WAIT_MS), "waited {:?}", t.elapsed());
+        let thread = built_on.recv_timeout(std::time::Duration::from_secs(10)).expect("a worker has the build");
+        assert!(thread.starts_with("xcl-pso"), "the build ran on {thread}");
+        go.send(()).unwrap();
+        // (the worker's build ends before the stand-in goes: an orphaned build releases its
+        // result, and 0x5C5C is no pipeline)
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let _ = released(standin);
     }
 
@@ -809,7 +841,7 @@ mod used_tests {
         }));
         let wanted = rx.recv().unwrap();
         assert!(!wanted(), "nobody waits yet");
-        assert_eq!(resolve_wait_for(standin, None), 0x5454);
+        assert_eq!(resolve_wait_for(standin, NO_LIMIT), 0x5454);
         assert!(wanted());
         assert!(!wanted_here()());
         let _ = released(standin);
@@ -831,7 +863,7 @@ mod used_tests {
         }));
         started.recv().unwrap();
         assert!(!build_is_wanted(), "this thread builds nothing");
-        assert_eq!(resolve_wait_for(standin, None), 0x5353, "the bind's wait reached the build");
+        assert_eq!(resolve_wait_for(standin, NO_LIMIT), 0x5353, "the bind's wait reached the build");
         let _ = released(standin);
     }
 
@@ -859,7 +891,7 @@ mod used_tests {
         assert_eq!(resolve(known), 0x4321);
         assert!(is_pending(unknown), "nobody used it and no earlier run did");
         assert!(!used::noted(unknown_key));
-        assert_eq!(resolve_wait(unknown), 0x4322);
+        assert_eq!(resolve_wait_for(unknown, NO_LIMIT), 0x4322);
         assert!(used::noted(unknown_key) && used::noted(known_key), "a first use is kept for the next run");
         released(known);
         released(unknown);
@@ -1119,14 +1151,18 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
-/// `resolve`, waiting for a pipeline still being built – built here if no worker has started
-/// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
+/// `resolve`, waiting for a pipeline still being built: the build stays the workers' and this
+/// thread waits `wait_budget()` for it. What keeps the pipeline a submit waits for from sitting
+/// behind the queue is `need_by_submit`, not this thread building it.
 pub fn resolve_wait(pso: usize) -> usize {
     resolve_wait_for(pso, wait_budget())
 }
 
-/// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
-fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
+/// `resolve_wait`, waiting at most `budget`; not built by then, the bind goes on with the
+/// stand-in (`resolve_within`). A bind never takes the job: on its own thread it would run the
+/// DXC translation and the driver compile outside the `real::big_compile_turn` slots, which only
+/// name `xcl-pso*` threads.
+fn resolve_wait_for(pso: usize, budget: std::time::Duration) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
     if p.spared.load(Ordering::Acquire) {
@@ -1134,32 +1170,31 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
     }
     // (the title's thread is held from here until the pipeline is built or the budget is over)
     let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
-    }
-    let job = p.job.lock().unwrap().take();
-    if let Some(job) = job {
-        complete(&p, job());
-    }
-    p.want();
-    let mut done = p.done.lock().unwrap();
-    while !*done {
-        done = p.cv.wait(done).unwrap();
-    }
-    match p.real.load(Ordering::Acquire) {
-        0 => p.stand(pso),
-        r => r,
-    }
+    resolve_within(&p, pso, budget)
 }
 
-/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
-/// it is built). A retail game builds compute programs on its own threads: the driver takes up to
-/// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
-/// has been held 30 s.
-fn wait_budget() -> Option<std::time::Duration> {
-    static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
+/// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0:
+/// `DEFAULT_WAIT_MS`). A retail game builds compute programs on its own threads: the driver takes
+/// up to 30 s for the biggest translated ones, and the title's watchdog ends it when its main
+/// thread has been held 30 s.
+fn wait_budget() -> std::time::Duration {
+    static B: OnceLock<std::time::Duration> = OnceLock::new();
+    *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map_or(std::time::Duration::from_millis(DEFAULT_WAIT_MS), std::time::Duration::from_millis))
 }
+
+/// What a bind waits with when `XCL_PSO_WAIT_MS` is unset or 0: finite, because a bind that waits
+/// without a limit takes the job and builds it on its own thread, where the huge-compile slots
+/// (`real::big_compile_turn`) do not apply. The number bounds the thread's stall, not the build:
+/// the programs a title first-uses as it loads compile in 46 – 103 ms (5 KB of DXIL) and the tail
+/// is 3 – 18 s (124 – 280 KB), which no budget under 20 s reaches. A run that waited 2 000 ms per
+/// bind showed 2 s windows with no submits, one for every bind that waited its budget out; 500 ms
+/// is a quarter of that and covers the ordinary compile several times over.
+const DEFAULT_WAIT_MS: u64 = 500;
+
+/// A bind's budget in the tests that want the build itself rather than a deadline: no bind builds
+/// on its own thread, so those tests wait for a free worker.
+#[cfg(test)]
+const NO_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
@@ -1297,8 +1332,8 @@ mod counts_tests {
     /// (real == 0) included – so `counts` is constant time and takes no `PENDING` lock.
     #[test]
     fn the_open_counter_tracks_stand_ins_not_built_yet() {
-        // the invariant: the counter equals the number of stand-ins not built yet. the
-        // stand-ins below are not sent to the workers, so only this thread completes them;
+        // the invariant: the counter equals the number of stand-ins not built yet. the binds
+        // below wait out the build (a worker runs it), so their stand-ins end when they return;
         // the snapshot retries until no other test's build ends mid-scan.
         let snap = || loop {
             let o1 = PENDING_OPEN.load(Ordering::Relaxed);
@@ -1322,12 +1357,12 @@ mod counts_tests {
         snap();
 
         // a successful build lowers the count
-        assert_eq!(resolve_wait_for(standins[0], None), 0x1234);
+        assert_eq!(resolve_wait_for(standins[0], NO_LIMIT), 0x1234);
         assert_eq!(mine(), 4, "a successful build ends its stand-in");
         snap();
 
         // a failed build (real == 0) lowers it too: the stand-in is returned, the entry is done
-        assert_eq!(resolve_wait_for(standins[1], None), standins[1], "a failed build returns the stand-in");
+        assert_eq!(resolve_wait_for(standins[1], NO_LIMIT), standins[1], "a failed build returns the stand-in");
         assert_eq!(mine(), 3, "a failed build ends its stand-in too");
         snap();
 
