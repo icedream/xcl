@@ -18,7 +18,7 @@
 
 #![allow(non_snake_case)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -2816,6 +2816,7 @@ pub(super) fn rt_scale() -> f32 {
 }
 
 unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    census_resource("display", desc, true);
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let scale = rt_scale();
     if scale < 1.0 {
@@ -2900,6 +2901,32 @@ unsafe fn scaled_placed_target(desc: usize) -> Option<[u8; 0x38]> {
     Some(x)
 }
 
+/// Census of the resources the title creates, to see which path its render targets and depth buffers
+/// take: counted by (path, dimension, flags, format, ALLOW_DISPLAY heap, width, height; buffers have
+/// no size in the key). Logged at 300 and at 3000 resources, at most 40 keys, most frequent first.
+static RESOURCE_CENSUS: Mutex<BTreeMap<(&'static str, u32, u32, u32, bool, u64, u32), u64>> = Mutex::new(BTreeMap::new());
+
+unsafe fn census_resource(path: &'static str, desc: usize, display_heap: bool) {
+    if desc == 0 || !crate::gpu::shader::readable(desc, 0x38) {
+        return;
+    }
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
+    let dim = u(0);
+    let (w, h) = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { (0, 0) } else { (u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()), u(0x18)) };
+    let mut census = RESOURCE_CENSUS.lock().unwrap();
+    *census.entry((path, dim, u(0x30), u(0x20), display_heap, w, h)).or_insert(0) += 1;
+    let total: u64 = census.values().sum();
+    if total == 300 || total == 3000 {
+        let mut rows: Vec<_> = census.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        crate::xlog_info!("D3D12.X: resource census after {total} resources, {} distinct", rows.len());
+        for ((path, dim, flags, format, display, w, h), n) in rows.into_iter().take(40) {
+            crate::xlog_info!("D3D12.X: census {path} dimension {dim} {w}x{h} format {format} flags {flags:#x} display heap {display}: {n}");
+        }
+    }
+}
+
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     static SEEN: AtomicU64 = AtomicU64::new(0);
     if desc != 0 && std::env::var_os("XCL_D3D12_TRACE").is_some() && SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
@@ -2916,6 +2943,7 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         );
         crate::xlog_info!("  desc (dwords): {:x?}", (0..16).map(|k| w(4 * k)).collect::<Vec<_>>());
     }
+    census_resource("committed", desc, flags as u32 & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 != 0);
     // console texture layouts (seen: 0x101, with 3 at +52) are not PC ones: the driver picks
     // its own (UNKNOWN); the console layout matters only where console code reads the memory
     let mut pc_desc = [0u8; 56];
@@ -3347,6 +3375,7 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     // the clear value in the PC's format of the resource (D3D12 wants the two to match)
     let mut clear_buf = [0u8; 24];
     let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf) as usize;
+    census_resource("placed", desc, pc_heap_desc(heap).is_some_and(|h| h.Flags.0 & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 != 0));
     let scaled = scaled_placed_target(desc);
     let desc = scaled.as_ref().map_or(desc, |d| d.as_ptr() as usize);
     // a buffer in a heap that has unified memory (`note_heap_uma`): that memory at its offset
@@ -3510,11 +3539,13 @@ unsafe fn is_reserved(res: *mut c_void) -> bool {
 
 /// CreateReservedResource
 pub(super) unsafe extern "system" fn dev_create_reserved_resource(this: *mut c_void, a1: usize, a2: usize, a3: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    census_resource("reserved", a1, false);
     note_reserved(pc_create_reserved_resource(this, a1, a2, a3, riid, ppv), ppv)
 }
 
 /// CreateReservedResource1
 pub(super) unsafe extern "system" fn dev_create_reserved_resource1(this: *mut c_void, a1: usize, a2: usize, a3: usize, a4: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    census_resource("reserved1", a1, false);
     note_reserved(pc_create_reserved_resource1(this, a1, a2, a3, a4, riid, ppv), ppv)
 }
 creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
