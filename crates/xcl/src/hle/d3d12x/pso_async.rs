@@ -1123,6 +1123,12 @@ impl Pending {
             d => d,
         }
     }
+
+    /// What a bind goes on with once its wait budget is over (`late`), counted for the metrics.
+    fn stand_late(&self, pso: usize) -> usize {
+        super::metrics::standin();
+        self.stand(pso)
+    }
 }
 
 /// Stand-in `standin` is no driver object (`standin::shell`): binds get `driver` in its place.
@@ -1211,7 +1217,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
-        return p.stand(pso);
+        return p.stand_late(pso);
     }
     p.want();
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
@@ -1225,7 +1231,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    p.stand(pso)
+    p.stand_late(pso)
 }
 
 /// `XCL_PSO_IMAGE_SKIP=1`: a bind does not wait for a big compute program that writes nothing
@@ -1265,7 +1271,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
                     crate::xlog_info!("D3D12.X: a compute program that writes only images is still being built: its dispatches are left out until it is ({} so far)", n + 1);
                 }
             }
-            p.stand(pso)
+            p.stand_late(pso)
         }
         r => r,
     }

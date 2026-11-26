@@ -45,6 +45,12 @@ static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub fn activity() -> (u64, u64) {
     (COUNTS[DRAWS].load(Ordering::Relaxed), COUNTS[DISPATCHES].load(Ordering::Relaxed))
 }
+
+/// draws and dispatches of console code skipped so far, for a pipeline still being built
+/// (`metrics`)
+pub fn skipped() -> (u64, u64) {
+    (COUNTS[DRAWS_SKIPPED].load(Ordering::Relaxed), COUNTS[DISPATCHES_SKIPPED].load(Ordering::Relaxed))
+}
 const DRAWS: usize = 0;
 const DRAWS_SKIPPED: usize = 1;
 const DRAWS_PC: usize = 2;

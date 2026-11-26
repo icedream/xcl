@@ -45,6 +45,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::thread::sleep(std::time::Duration::from_secs(10));
         crate::hle::d3d12x::real::log_dispatch_chain_counts();
     });
+    // what the run spent compiling pipelines and what that cost it in frames: every 60 s
+    crate::hle::d3d12x::metrics::start();
+    let _ = std::thread::Builder::new().name("xcl-metrics".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        crate::hle::d3d12x::metrics::log();
+    });
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {

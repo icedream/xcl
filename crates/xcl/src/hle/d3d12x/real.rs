@@ -133,6 +133,9 @@ pub struct D3d12Stats {
     /// DXIL cache and compiler statistics.
     #[serde(default)]
     pub dxil_cache: crate::gpu::recomp::dxc::CacheStats,
+    /// what the run spent compiling pipelines and what that cost it in frames (`metrics`)
+    #[serde(default)]
+    pub metrics: super::metrics::Metrics,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -424,6 +427,7 @@ pub fn stats() -> D3d12Stats {
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.iter().map(|(_, m)| m.clone()).collect()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
+        metrics: super::metrics::snapshot(),
     }
 }
 
@@ -4280,11 +4284,14 @@ fn pso_trace() -> bool {
 /// A timed driver compile with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
-fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
+fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> HRESULT) -> (HRESULT, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
     let waited = waited.elapsed();
+    if huge {
+        super::metrics::gate_wait(waited);
+    }
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let log = pso_trace() || bytes >= huge_pso_bytes();
@@ -4295,8 +4302,10 @@ fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Op
         crate::xlog_info!("D3D12.X: driver compile start #{sequence}: {kind} PSO, {bytes} B DXIL{record}");
     }
     let started = std::time::Instant::now();
+    super::metrics::compile_started();
     let r = build();
     let took = started.elapsed();
+    super::metrics::compile_done(took, r < 0);
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
     }

@@ -183,6 +183,8 @@ pub fn write_final(crash: Option<String>) {
     }
     let Some(_g) = lock_within(&WRITE_LOCK, wait) else { return };
     let Some(boot) = crate::state::boot() else { return };
+    // the run's compile time and what it cost it in frames, once, before the report is built
+    crate::hle::d3d12x::metrics::log_final();
     let r = build();
     if let Ok(s) = serde_json::to_string_pretty(&r) {
         let _ = std::fs::write(boot.report_path(), s);
