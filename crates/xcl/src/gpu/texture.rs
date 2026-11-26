@@ -13,6 +13,7 @@
 use super::desc::{self, Image, ImageType};
 use super::fence;
 use super::tiling::{self, Chain, PipeConfig};
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Pipes / packers of the console's GB_ADDR_CONFIG – only the XOR (_X) modes depend on it.
@@ -221,6 +222,27 @@ unsafe impl Send for Uploader {}
 /// queue (raw pointer) → its uploader, while no batch uses it
 static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploader>>> = std::sync::Mutex::new(None);
 
+/// batches `upload_batch` submitted, and the milliseconds it spent inside `fence::wait` for
+/// them, for the activity line
+static UPLOAD_BATCHES: AtomicU64 = AtomicU64::new(0);
+static UPLOAD_WAIT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// (batches submitted, milliseconds waited on their fences) – see `upload_batch`
+pub fn upload_wait_counters() -> (u64, u64) {
+    (UPLOAD_BATCHES.load(Ordering::Relaxed), UPLOAD_WAIT_MS.load(Ordering::Relaxed))
+}
+
+/// `XCL_TEXTURE_SLOW_MS=<ms>`: log when one `upload_batch` submit+wait takes at least this
+/// many milliseconds; unset: off.
+fn slow_ms() -> Option<u128> {
+    static V: std::sync::OnceLock<Option<u128>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| parse_slow_ms(std::env::var("XCL_TEXTURE_SLOW_MS").ok().as_deref()))
+}
+
+fn parse_slow_ms(v: Option<&str>) -> Option<u128> {
+    v.and_then(|v| v.trim().parse::<u128>().ok())
+}
+
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
@@ -303,11 +325,27 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
     up.list.Close().map_err(err)?;
+    let t0 = std::time::Instant::now();
     queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&up.list).map_err(err)?)]);
     up.value += 1;
     let copy_error = |e| format!("texture copy: {e}");
     queue.Signal(&up.fence, up.value).map_err(|e| copy_error(fence::api_error(dev, "Signal", e)))?;
-    if let Err(e) = fence::wait(&up.fence, up.value, dev, None, 10_000) {
+    let t_wait = std::time::Instant::now();
+    let r = fence::wait(&up.fence, up.value, dev, None, 10_000);
+    let waited = t_wait.elapsed().as_millis();
+    let ms = t0.elapsed().as_millis();
+    UPLOAD_BATCHES.fetch_add(1, Ordering::Relaxed);
+    UPLOAD_WAIT_MS.fetch_add(waited as u64, Ordering::Relaxed);
+    if let Some(slow) = slow_ms() {
+        if ms >= slow {
+            let tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+            crate::xlog_info!(
+                "texture upload: {} copies, {} MB, submit+wait {ms} ms on thread {tid} (uploader {key:#x}, fence {:#x}, completed {:#x})",
+                planned.len(), total >> 20, up.value, up.fence.GetCompletedValue()
+            );
+        }
+    }
+    if let Err(e) = r {
         // the GPU may still read the upload buffer and run the list: they stay alive (a fresh
         // uploader next time) – freeing them under the GPU removed the device
         std::mem::forget(up);
@@ -537,6 +575,17 @@ mod tests {
         assert!(validate_subresource_count(&rd, 4).is_ok());
         rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         assert!(validate_subresource_count(&rd, 4).unwrap_err().contains("requires a texture"));
+    }
+
+    /// `XCL_TEXTURE_SLOW_MS` is off unless it parses as a nonnegative number.
+    #[test]
+    fn texture_slow_ms_env_parser_is_off_unless_a_nonnegative_number() {
+        assert_eq!(parse_slow_ms(None), None);
+        assert_eq!(parse_slow_ms(Some("")), None);
+        assert_eq!(parse_slow_ms(Some("0")), Some(0));
+        assert_eq!(parse_slow_ms(Some("-1")), None);
+        assert_eq!(parse_slow_ms(Some("50")), Some(50));
+        assert_eq!(parse_slow_ms(Some(" 50 ")), Some(50));
     }
 
     /// Random linear subresources for `t`, and the console memory they are, tiled.

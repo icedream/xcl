@@ -53,7 +53,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (d, x) = crate::hle::d3d12x::bind::activity();
                 let f = crate::hle::d3d12x::frame::activity();
                 let (r, b, fail) = crate::hle::dstorage::counters();
-                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
+                let (ub, uw) = crate::gpu::texture::upload_wait_counters();
+                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail, ub, uw]
             };
             let mut last = snap();
             loop {
@@ -61,8 +62,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
-                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed",
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]
+                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed; texture uploads {} batches, {} ms waited",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], d[11], d[12]
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = unsafe {
