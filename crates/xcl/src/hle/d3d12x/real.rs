@@ -4348,11 +4348,29 @@ fn publish_in_flight(key: &str, flight: &std::sync::Arc<InFlight>, hr: HRESULT, 
     flight.done.notify_all();
 }
 
+/// Content identity of the XCL ABI root signature a compute pipeline is built with: its static
+/// samplers and the chain variant, as bytes, hashed (`gpu::shader::fnv64`). `pso::abi_signature`
+/// builds the whole description from them and fixed parameters, so they decide the serialized
+/// root signature – the same content at a different address has the same id, different content
+/// a different one.
+fn rs_content_id(samplers: &[crate::gpu::recomp::pso::StaticSampler], chained: bool) -> u64 {
+    let mut bytes: Vec<u8> = Vec::with_capacity(samplers.len() * 17 + 1);
+    for (w, comparison) in samplers {
+        for word in w {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.push(*comparison as u8);
+    }
+    bytes.push(chained as u8);
+    crate::gpu::shader::fnv64(&bytes)
+}
+
 /// The in-flight identity of a compute-style compile: the blob cache's own name of the DXIL
-/// and its flags (`driver_cache::name_for`), with the pipeline kind and the root signature
-/// the blob key (`compute_blob_key`) also carries.
-fn compute_compile_key(dxil: &[u8], rs: usize, flags: i32, chained: bool) -> String {
-    format!("compute/{}/rs {rs:x}", driver_cache::name_for(dxil, flags, chained))
+/// and its flags (`driver_cache::name_for`), with the pipeline kind and the root signature's
+/// content (`rs_content_id`) – not its address, so the same root signature at another address
+/// compiles once and an address reused for a different one cannot collide.
+fn compute_compile_key(dxil: &[u8], rs_id: u64, flags: i32, chained: bool) -> String {
+    format!("compute/{}/rs {rs_id:016x}", driver_cache::name_for(dxil, flags, chained))
 }
 
 /// The in-flight identity of a graphics compile: the blob cache's `graphics_name` of the
@@ -4837,7 +4855,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     let record = crate::gpu::shader::fnv64(cs);
     let warm = compiled.dispatch_chain.as_ref().and_then(|_| {
         let rs = abi_rs_for(this, &compiled.samplers)?;
-        let result = compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
+        let result = compute_container(this, f, d, rs, rs_content_id(&compiled.samplers, false), &dxil, record, riid, ppv, ComputeBuild::CachedWhole);
         (result.0 >= 0).then_some((rs, result))
     });
     if let Some(plan) = compiled.dispatch_chain.filter(|_| warm.is_none()) {
@@ -4860,7 +4878,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
                 super::pso_async::note_failure("no root signature for the CS", format!("{} B DXIL", dxil.len()));
                 return Some(Err(()));
             };
-            (rs, compute_container(this, f, d, rs, &dxil, record, riid, ppv, ComputeBuild::Whole))
+            (rs, compute_container(this, f, d, rs, rs_content_id(&compiled.samplers, false), &dxil, record, riid, ppv, ComputeBuild::Whole))
         }
     };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
@@ -4913,7 +4931,7 @@ enum ComputeBuild {
 }
 
 unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPELINE_STATE_DESC, rs: *mut c_void,
-    dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
+    rs_id: u64, dxil: &[u8], record: u64, riid: *const GUID, ppv: *mut *mut c_void, mode: ComputeBuild) -> (HRESULT, std::time::Duration, bool) {
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(dxil);
@@ -4921,7 +4939,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
-    let flight_key = compute_compile_key(dxil, rs as usize, copy.Flags.0, mode == ComputeBuild::Chain);
+    let flight_key = compute_compile_key(dxil, rs_id, copy.Flags.0, mode == ComputeBuild::Chain);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
     let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
@@ -5314,14 +5332,15 @@ mod compile_key_tests {
     #[test]
     fn identical_requests_produce_one_compile_key_and_different_flags_another() {
         let dxil = vec![7u8; 4096];
-        let a = compute_compile_key(&dxil, 0x1000, 0, false);
-        assert_eq!(a, compute_compile_key(&dxil.clone(), 0x1000, 0, false));
-        assert_ne!(a, compute_compile_key(&dxil, 0x1000, 1, false), "different flags");
-        assert_ne!(a, compute_compile_key(&dxil, 0x2000, 0, false), "a different root signature");
-        assert_ne!(a, compute_compile_key(&dxil, 0x1000, 0, true), "the chain namespace");
+        let rs = rs_content_id(&[([0x5eed, 0, 0, 0], true)], false);
+        let a = compute_compile_key(&dxil, rs, 0, false);
+        assert_eq!(a, compute_compile_key(&dxil.clone(), rs, 0, false));
+        assert_ne!(a, compute_compile_key(&dxil, rs, 1, false), "different flags");
+        assert_ne!(a, compute_compile_key(&dxil, rs_content_id(&[([0x5eed, 0, 0, 1], true)], false), 0, false), "a different root signature");
+        assert_ne!(a, compute_compile_key(&dxil, rs, 0, true), "the chain namespace");
         let mut other = dxil.clone();
         other[0] ^= 1;
-        assert_ne!(a, compute_compile_key(&other, 0x1000, 0, false), "a different program");
+        assert_ne!(a, compute_compile_key(&other, rs, 0, false), "a different program");
         let g = graphics_compile_key(0xabc, 4096);
         assert_eq!(g, graphics_compile_key(0xabc, 4096));
         assert_ne!(g, graphics_compile_key(0xabc, 4097));
@@ -5333,8 +5352,37 @@ mod compile_key_tests {
     }
 
     #[test]
+    fn the_root_signature_content_not_its_address_decides_the_compute_key() {
+        let dxil = b"program";
+        // two root signatures with identical content, as created at two different addresses
+        let samplers: Vec<crate::gpu::recomp::pso::StaticSampler> = vec![([1, 2, 3, 4], true), ([5, 6, 7, 8], false)];
+        let id = rs_content_id(&samplers, false);
+        assert_eq!(id, rs_content_id(&samplers.clone(), false), "the same samplers are the same content");
+        let key = compute_compile_key(dxil, id, 0, false);
+        assert_eq!(key, compute_compile_key(dxil, rs_content_id(&samplers, false), 0, false), "same content at another address, same key");
+        // different content: another sampler word, another comparison flag, one more sampler, another order
+        let variants: Vec<Vec<crate::gpu::recomp::pso::StaticSampler>> = vec![
+            vec![([1, 2, 3, 9], true), ([5, 6, 7, 8], false)],
+            vec![([1, 2, 3, 4], false), ([5, 6, 7, 8], false)],
+            vec![([1, 2, 3, 4], true), ([5, 6, 7, 8], false), ([9, 9, 9, 9], true)],
+            samplers.iter().rev().cloned().collect(),
+        ];
+        for other in &variants {
+            let other_id = rs_content_id(other, false);
+            assert_ne!(id, other_id, "different content, different id");
+            assert_ne!(key, compute_compile_key(dxil, other_id, 0, false), "different content, different key");
+        }
+        // the chain root signature is a different signature even with the same samplers
+        assert_ne!(key, compute_compile_key(dxil, rs_content_id(&samplers, true), 0, true));
+        // the key keeps its shape: the kind, the driver-cache name of the program, the root signature part
+        assert!(key.starts_with("compute/"), "{key}");
+        assert_eq!(key.matches("/rs ").count(), 1, "{key}");
+        assert!(key.ends_with(&format!("/rs {id:016x}")), "{key}");
+    }
+
+    #[test]
     fn an_in_flight_compile_is_entered_once_and_its_outcome_is_shared() {
-        let key = compute_compile_key(b"program", 0x1000, 0, false);
+        let key = compute_compile_key(b"program", rs_content_id(&[], false), 0, false);
         let first = std::thread::spawn({
             let key = key.clone();
             move || match enter_in_flight(&key, std::ptr::null_mut()) {
@@ -5401,7 +5449,7 @@ mod pso_cache_tests {
     #[test]
     fn a_built_pipeline_is_kept_and_a_repeat_request_reuses_it_without_compiling() {
         let _g = TEST_LOCK.lock().unwrap();
-        let key = compute_compile_key(b"pso-cache-test program", 0x1000, 0, false);
+        let key = compute_compile_key(b"pso-cache-test program", rs_content_id(&[], false), 0, false);
         let pso = fake_pso();
         let builds = AtomicU64::new(0);
         let outp: *mut *mut c_void = Box::into_raw(Box::new(std::ptr::null_mut())) as *mut *mut c_void;
@@ -5426,7 +5474,7 @@ mod pso_cache_tests {
         assert_eq!(refs(pso), 3, "one more reference for the reusing caller");
         assert_eq!(super::super::metrics::snapshot().pso_cache_hits, hits_before + 1, "the reuse is counted");
         // a different program (different flags) is a different key: compiled, not reused
-        let other = compute_compile_key(b"pso-cache-test program", 0x1000, 1, false);
+        let other = compute_compile_key(b"pso-cache-test program", rs_content_id(&[], false), 1, false);
         let (hr, _) = driver_compile_identified("compute", 128, true, None, Some(other), outp, || {
             builds.fetch_add(1, Ordering::Relaxed);
             unsafe { *outp = pso };
@@ -6957,7 +7005,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     // the compute pass's object-cache key (the same identity a standalone compute compile of
     // `tp.cs` uses); a cache hit never waits, so it cannot deadlock the gate the way an
     // in-flight join could – hence still no in-flight key here, as before
-    let cobj = compute_compile_key(&tp.cs, rs as usize, 0, false);
+    let cobj = compute_compile_key(&tp.cs, rs_content_id(&tp.samplers, false), 0, false);
     let compute_kept = pso_cache_get(&cobj, &mut compute as *mut *mut c_void);
     // no in-flight key here: this caller may hold the turn above, and joining a compile whose
     // first requester waits for a slot would deadlock the gate
