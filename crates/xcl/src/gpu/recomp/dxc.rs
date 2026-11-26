@@ -753,13 +753,14 @@ fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
     cache_key_for_toolchain(src, entry, profile, toolchain_identity())
 }
 
-/// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
+/// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `dxil` under the data root
+/// (`launcher::data_root`: `%XCL_DATA_ROOT%` or `%LOCALAPPDATA%\XCL`), so one variable moves
+/// the logs, the reports and the cache together.
 pub fn cache_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XCL_DXIL_CACHE") {
         return PathBuf::from(d);
     }
-    let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-    base.join("xcl").join("dxil")
+    crate::launcher::data_root().join("dxil")
 }
 
 /// DXIL cache statistics for this process.
@@ -1162,6 +1163,48 @@ mod cache_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// The cache folder is the data root's `dxil`, and `XCL_DATA_ROOT` picks that root. The data
+    /// root comes from the environment, which is process-wide, so a child process asks: no other
+    /// test sees the variables this one needs.
+    #[test]
+    fn cache_dir_follows_the_data_root() {
+        use std::process::Command;
+
+        const RUN: &str = "XCL_TEST_CACHE_ROOT_RUN";
+        if std::env::var_os(RUN).is_some() {
+            let expected = match std::env::var_os("XCL_DATA_ROOT") {
+                Some(root) => PathBuf::from(root).join("dxil"),
+                // without it: `%LOCALAPPDATA%\XCL\dxil`, where earlier runs left their cache
+                None => PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("XCL").join("dxil"),
+            };
+            assert_eq!(cache_dir(), expected, "cache folder of this data root");
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("xcl-data-root-{}", std::process::id()));
+        for data_root in [Some(base.join("data")), None] {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args(["gpu::recomp::dxc::cache_tests::cache_dir_follows_the_data_root", "--exact", "--nocapture"])
+                .env(RUN, "1")
+                .env("LOCALAPPDATA", base.join("localappdata"))
+                .env_remove("XCL_DXIL_CACHE");
+            match &data_root {
+                Some(root) => {
+                    cmd.env("XCL_DATA_ROOT", root);
+                }
+                None => {
+                    cmd.env_remove("XCL_DATA_ROOT");
+                }
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "data root {data_root:?}: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 
     fn synthetic_dxil(marker: u8) -> Vec<u8> {
         let mut b = vec![0u8; 68];
