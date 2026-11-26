@@ -322,6 +322,23 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     up.list.Reset(&up.alloc, None).map_err(err)?;
     for (k, l, base) in &planned {
         let (res, subs, states) = &items[*k];
+        // Record page data for dedup census when enabled
+        if std::env::var_os("XCL_PAGE_DEDUP_CENSUS").is_some() {
+            let rd = res.GetDesc();
+            let format = rd.Format.0 as u32;
+            for s in subs {
+                // For each subresource, record its pages
+                // For block-compressed formats, we hash at the block level
+                // For uncompressed, we hash at the row level
+                crate::hle::d3d12x::memory_census::record_page_data(
+                    format,
+                    &s.data,
+                    s.row_bytes,
+                    s.rows,
+                    s.depth
+                );
+            }
+        }
         record_into(&up.list, res, subs, l, states, states, &staging, mapped, *base);
     }
     up.list.Close().map_err(err)?;

@@ -47,6 +47,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     });
     // what the run spent compiling pipelines and what that cost it in frames: every 60 s
     crate::hle::d3d12x::metrics::start();
+    // memory census: bytes by format and page dedup tracking
+    crate::hle::d3d12x::memory_census::init();
     let _ = std::thread::Builder::new().name("xcl-metrics".into()).spawn(|| loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
         crate::hle::d3d12x::metrics::log();

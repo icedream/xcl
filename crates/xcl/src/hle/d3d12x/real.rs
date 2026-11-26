@@ -136,6 +136,9 @@ pub struct D3d12Stats {
     /// what the run spent compiling pipelines and what that cost it in frames (`metrics`)
     #[serde(default)]
     pub metrics: super::metrics::Metrics,
+    /// memory census: bytes by format, BC7 opaque bytes, and texture page dedup stats
+    #[serde(default)]
+    pub memory_census: super::memory_census::MemoryCensusMetrics,
 }
 
 static ADAPTER: Mutex<String> = Mutex::new(String::new());
@@ -428,6 +431,7 @@ pub fn stats() -> D3d12Stats {
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
         metrics: super::metrics::snapshot(),
+        memory_census: super::memory_census::get_metrics(),
     }
 }
 
@@ -2936,6 +2940,9 @@ unsafe fn census_resource(path: &'static str, desc: usize, display_heap: bool) {
             crate::xlog_info!("D3D12.X: census {path} dimension {dim} {w}x{h} format {format} flags {flags:#x} display heap {display}: {n}");
         }
     }
+    
+    // Memory census: track bytes by format when XCL_CENSUS_BYTES=1
+    super::memory_census::record_resource(path, desc, display_heap);
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {

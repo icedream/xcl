@@ -28,6 +28,7 @@ pub mod null;
 pub mod present;
 pub mod pso_async;
 pub mod real;
+pub mod memory_census;
 mod shader_cache_session;
 pub mod sparse;
 mod standin;
