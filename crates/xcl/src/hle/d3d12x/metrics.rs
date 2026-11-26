@@ -22,6 +22,9 @@ pub struct Metrics {
     pub compiles_started: u64,
     pub compiles_done: u64,
     pub compiles_failed: u64,
+    /// pipelines handed back from the built-PSO cache (`real.rs` `PSO_CACHE`) instead of
+    /// compiled again
+    pub pso_cache_hits: u64,
     pub driver_ms: u64,
     /// compiles that waited for a huge-compile slot, and the time they waited for it
     pub gated_compiles: u64,
@@ -55,6 +58,8 @@ static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static COMPILES_STARTED: AtomicU64 = AtomicU64::new(0);
 static COMPILES_DONE: AtomicU64 = AtomicU64::new(0);
 static COMPILES_FAILED: AtomicU64 = AtomicU64::new(0);
+/// a request was handed a pipeline from the built-PSO cache instead of compiling again
+static PSO_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static DRIVER_MICROS: AtomicU64 = AtomicU64::new(0);
 static GATED_COMPILES: AtomicU64 = AtomicU64::new(0);
 static SLOT_WAIT_MICROS: AtomicU64 = AtomicU64::new(0);
@@ -114,6 +119,11 @@ pub fn gate_wait(waited: Duration) {
     SLOT_WAIT_MICROS.fetch_add(micros(waited), Ordering::Relaxed);
 }
 
+/// A request for an already built pipeline was served from the PSO cache (`PSO_CACHE_HITS`).
+pub fn pso_cache_hit() {
+    PSO_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The counts a frame shown at `to` adds to the gap since the one at `from` (µs since
 /// `epoch()`): the gap, and whether it was over 1 s and over 10 s. `None` for the run's first
 /// frame – the wait before it is the run's startup, not a gap between two frames.
@@ -159,6 +169,7 @@ pub fn snapshot() -> Metrics {
         compiles_started: COMPILES_STARTED.load(Ordering::Relaxed),
         compiles_done: COMPILES_DONE.load(Ordering::Relaxed),
         compiles_failed: COMPILES_FAILED.load(Ordering::Relaxed),
+        pso_cache_hits: PSO_CACHE_HITS.load(Ordering::Relaxed),
         driver_ms: DRIVER_MICROS.load(Ordering::Relaxed) / 1000,
         gated_compiles: GATED_COMPILES.load(Ordering::Relaxed),
         slot_wait_ms: SLOT_WAIT_MICROS.load(Ordering::Relaxed) / 1000,
@@ -189,15 +200,16 @@ fn secs(ms: u64) -> f64 {
 
 /// The metrics line's numbers, as `log` and `log_final` write them (the slots are
 /// `compiles_peak` of them, `slots_busy_pct` of the wall):
-/// `compiles 28 started/28 done/0 failed, driver 218.9 s over 162.0 s wall (slots 67% busy),
-/// presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41,
-/// write64-skips 0, mwaitx>2s 0, xasync>5s 0`
+/// `compiles 28 started/28 done/0 failed, pso-cache hits 0, driver 218.9 s over 162.0 s wall
+/// (slots 67% busy), presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3,
+/// stand-ins 41, write64-skips 0, mwaitx>2s 0, xasync>5s 0`
 fn line(m: &Metrics) -> String {
     format!(
-        "compiles {} started/{} done/{} failed, driver {:.1} s over {:.1} s wall (slots {}% busy), presents {}, longest present gap {:.1} s, gaps>1s {}, gaps>10s {}, stand-ins {}, write64-skips {}, mwaitx>2s {}, xasync>5s {}",
+        "compiles {} started/{} done/{} failed, pso-cache hits {}, driver {:.1} s over {:.1} s wall (slots {}% busy), presents {}, longest present gap {:.1} s, gaps>1s {}, gaps>10s {}, stand-ins {}, write64-skips {}, mwaitx>2s {}, xasync>5s {}",
         m.compiles_started,
         m.compiles_done,
         m.compiles_failed,
+        m.pso_cache_hits,
         secs(m.driver_ms),
         secs(m.wall_ms),
         slots_busy_pct(m),
@@ -278,7 +290,7 @@ mod tests {
         m.standins = 41;
         assert_eq!(
             line(&m),
-            "compiles 28 started/28 done/0 failed, driver 218.9 s over 162.0 s wall (slots 67% busy), presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41, write64-skips 0, mwaitx>2s 0, xasync>5s 0"
+            "compiles 28 started/28 done/0 failed, pso-cache hits 0, driver 218.9 s over 162.0 s wall (slots 67% busy), presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41, write64-skips 0, mwaitx>2s 0, xasync>5s 0"
         );
     }
 

@@ -4367,6 +4367,102 @@ fn mesh_compile_key(kind: &str, hash: u64, bytes: usize) -> String {
     format!("{kind}/{}", driver_cache::mesh_name(hash, bytes))
 }
 
+/// A built pipeline object kept for reuse. The driver returns 0 KB blobs, so a later request
+/// for the same program cannot reuse a blob – it reuses the PSO itself. `pso` holds one owning
+/// reference (AddRef'd on insert, Release'd on eviction); the process keeps one reference to
+/// the device for its whole lifetime (`DEVICE`), so the entries live until the process ends
+/// with it – there is no device destruction to release them at before that.
+struct PsoCacheEntry {
+    pso: *mut c_void,
+    /// the DXIL size the pipeline was built from (bookkeeping, read by the tests)
+    #[allow(dead_code)]
+    bytes: usize,
+    reuses: u64,
+    /// insertion order, for the FIFO eviction
+    seq: u64,
+}
+
+// the pipeline pointer is only AddRef'd/Release'd, never dereferenced as an object here
+unsafe impl Send for PsoCacheEntry {}
+unsafe impl Sync for PsoCacheEntry {}
+
+/// Built pipeline objects by compile key – the same identity the in-flight map uses
+/// (`compute_compile_key` / `graphics_compile_key` / `mesh_compile_key`), bounded by
+/// `pso_cache_max`.
+static PSO_CACHE: Mutex<Option<HashMap<String, PsoCacheEntry>>> = Mutex::new(None);
+
+/// `XCL_PSO_CACHE_MAX=<entries>`: how many built pipeline objects to keep for reuse; 0 disables
+/// the cache. Default 4096.
+fn pso_cache_max() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_PSO_CACHE_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(4096))
+}
+
+/// Release one reference of a stored pipeline object.
+unsafe fn release_pso_ref(pso: *mut c_void) {
+    let release: RefFn = std::mem::transmute(*vt(pso).add(2));
+    release(pso);
+}
+
+/// A pipeline of `key` is already built and kept: AddRef it into `ppv` and count the reuse.
+/// Checked before any gating or driver call; the lock is dropped before the AddRef, so nothing
+/// waits and no call on the stored object happens under it.
+fn pso_cache_get(key: &str, ppv: *mut *mut c_void) -> bool {
+    let pso = {
+        let mut m = PSO_CACHE.lock().unwrap();
+        match m.as_mut().and_then(|map| map.get_mut(key)) {
+            Some(e) => {
+                e.reuses += 1;
+                e.pso
+            }
+            None => return false,
+        }
+    };
+    unsafe {
+        // one more reference for this caller
+        let add: RefFn = std::mem::transmute(*vt(pso).add(1));
+        add(pso);
+        if !ppv.is_null() {
+            *ppv = pso;
+        }
+    }
+    super::metrics::pso_cache_hit();
+    true
+}
+
+/// Keep the pipeline `pso` (built from `bytes` of DXIL) for later requests of `key`, taking one
+/// owning reference; the caller's own reference in `ppv` stays with the caller. When the cache
+/// is full the oldest entry is evicted (FIFO), so a working set that fits is not thrashed the
+/// way a clear-and-relearn would. The AddRef/Release calls happen outside the lock: under it
+/// only the map is touched.
+fn pso_cache_put(key: &str, pso: *mut c_void, bytes: usize) {
+    if pso.is_null() || pso_cache_max() == 0 {
+        return;
+    }
+    unsafe {
+        let add: RefFn = std::mem::transmute(*vt(pso).add(1));
+        add(pso);
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let evicted = {
+        let mut m = PSO_CACHE.lock().unwrap();
+        let map = m.get_or_insert_with(HashMap::new);
+        let mut evicted = map.insert(key.to_string(), PsoCacheEntry { pso, bytes, reuses: 0, seq }).map_or_else(Vec::new, |old| vec![old.pso]);
+        while map.len() > pso_cache_max() {
+            let Some(oldest) = map.iter().min_by_key(|(_, e)| e.seq).map(|(k, _)| k.clone()) else { break };
+            match map.remove(&oldest) {
+                Some(e) => evicted.push(e.pso),
+                None => break,
+            }
+        }
+        evicted
+    };
+    for p in evicted {
+        unsafe { release_pso_ref(p) };
+    }
+}
+
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
@@ -4393,6 +4489,13 @@ fn pso_trace() -> bool {
 /// in-flight identity of the work – a program already being compiled is not compiled again,
 /// the second requester waits for the first one's result (`ppv` gets its pipeline object).
 fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, key: Option<String>, ppv: *mut *mut c_void, build: impl FnOnce() -> HRESULT) -> (HRESULT, std::time::Duration) {
+    // a pipeline of this key was already built and kept: hand it back – no slot, no metrics,
+    // no driver call (the driver's blobs are 0 KB, so this is the only reuse left)
+    if let Some(k) = &key {
+        if pso_cache_get(k, ppv) {
+            return (S_OK, std::time::Duration::ZERO);
+        }
+    }
     // the same program is already being compiled: wait for that compile and share its result
     // instead of starting a second one (no slot, no metrics, no driver call – a batch of
     // identical requests counts as the one compile)
@@ -4426,6 +4529,10 @@ fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Optio
     }
     if let (Some(k), Some(Ok(f))) = (key.as_deref(), &flight) {
         publish_in_flight(k, f, r, ppv);
+        // the built pipeline is kept for later requests of the same key
+        if r >= 0 && !ppv.is_null() && unsafe { !(*ppv).is_null() } {
+            pso_cache_put(k, unsafe { *ppv }, bytes);
+        }
     }
     (r, took)
 }
@@ -5251,6 +5358,124 @@ mod compile_key_tests {
             Ok(f) => publish_in_flight(&key, &f, S_OK, std::ptr::null_mut()),
             Err(hr) => panic!("a published compile is no longer in flight ({hr:#x})"),
         }
+    }
+}
+
+#[cfg(test)]
+mod pso_cache_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    /// the cache is global and the tests share it: one at a time, or the eviction test's bulk
+    /// inserts would race the others' entries
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// a stand-in `ID3D12PipelineState`: a vtable of QueryInterface/AddRef/Release and a refcount
+    struct FakePso {
+        vt: usize,
+        refs: AtomicU64,
+    }
+
+    unsafe extern "system" fn fake_qi(_: *mut c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+        E_NOINTERFACE
+    }
+    unsafe extern "system" fn fake_add(p: *mut c_void) -> u32 {
+        let o = unsafe { &*(p as *const FakePso) };
+        o.refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+    }
+    unsafe extern "system" fn fake_release(p: *mut c_void) -> u32 {
+        let o = unsafe { &*(p as *const FakePso) };
+        o.refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1
+    }
+
+    /// one reference, as a driver-created pipeline object would have
+    fn fake_pso() -> *mut c_void {
+        let vt: &'static [usize; 3] = Box::leak(Box::new([fake_qi as usize, fake_add as usize, fake_release as usize]));
+        Box::into_raw(Box::new(FakePso { vt: vt.as_ptr() as usize, refs: AtomicU64::new(1) })) as *mut c_void
+    }
+
+    fn refs(pso: *mut c_void) -> u64 {
+        unsafe { (*(pso as *const FakePso)).refs.load(Ordering::Relaxed) }
+    }
+
+    #[test]
+    fn a_built_pipeline_is_kept_and_a_repeat_request_reuses_it_without_compiling() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let key = compute_compile_key(b"pso-cache-test program", 0x1000, 0, false);
+        let pso = fake_pso();
+        let builds = AtomicU64::new(0);
+        let outp: *mut *mut c_void = Box::into_raw(Box::new(std::ptr::null_mut())) as *mut *mut c_void;
+        let hits_before = super::super::metrics::snapshot().pso_cache_hits;
+        let (hr, _took) = driver_compile_identified("compute", 128, true, None, Some(key.clone()), outp, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            unsafe { *outp = pso };
+            S_OK
+        });
+        assert!(hr >= 0, "the first request compiles ({hr:#x})");
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert_eq!(unsafe { *outp }, pso);
+        assert_eq!(refs(pso), 2, "the caller's reference and the cache's");
+        // the repeat request: same key, no build, the stored pipeline AddRef'd into `ppv`
+        let (hr, took) = driver_compile_identified("compute", 128, true, None, Some(key.clone()), outp, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            S_OK
+        });
+        assert!(hr >= 0 && took.is_zero(), "a cache hit returns at once ({hr:#x})");
+        assert_eq!(builds.load(Ordering::Relaxed), 1, "no second compile");
+        assert_eq!(unsafe { *outp }, pso);
+        assert_eq!(refs(pso), 3, "one more reference for the reusing caller");
+        assert_eq!(super::super::metrics::snapshot().pso_cache_hits, hits_before + 1, "the reuse is counted");
+        // a different program (different flags) is a different key: compiled, not reused
+        let other = compute_compile_key(b"pso-cache-test program", 0x1000, 1, false);
+        let (hr, _) = driver_compile_identified("compute", 128, true, None, Some(other), outp, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            unsafe { *outp = pso };
+            S_OK
+        });
+        assert!(hr >= 0);
+        assert_eq!(builds.load(Ordering::Relaxed), 2, "different flags do not reuse");
+    }
+
+    #[test]
+    fn the_same_key_reuses_and_a_different_key_does_not() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let a = graphics_compile_key(0xabc, 4096);
+        let pso = fake_pso();
+        pso_cache_put(&a, pso, 4096);
+        let mut out: *mut c_void = std::ptr::null_mut();
+        assert!(pso_cache_get(&a, &mut out as *mut *mut c_void), "the kept pipeline is handed back");
+        assert_eq!(out, pso);
+        assert_eq!(refs(pso), 3, "the caller's, the cache's and the reusing caller's");
+        // the entry's bookkeeping: one reuse, the size it was built from
+        let m = PSO_CACHE.lock().unwrap();
+        let e = m.as_ref().unwrap().get(&a).unwrap();
+        assert_eq!(e.reuses, 1);
+        assert_eq!(e.bytes, 4096);
+        drop(m);
+        assert!(!pso_cache_get(&graphics_compile_key(0xabc, 4097), &mut out as *mut *mut c_void), "a different size is another entry");
+        assert!(!pso_cache_get(&graphics_compile_key(0xabd, 4096), &mut out as *mut *mut c_void), "a different hash is another entry");
+        assert!(!pso_cache_get(&mesh_compile_key("MS", 0xabc, 4096), &mut out as *mut *mut c_void), "the pipeline kinds never share an entry");
+        assert!(!pso_cache_get("never-built", std::ptr::null_mut()), "an empty cache misses");
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_evicts_the_oldest_entry_first() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let max = pso_cache_max();
+        assert!(max > 0, "the default bound is on");
+        let oldest_key = format!("pso-cache-evict-test/oldest");
+        let oldest = fake_pso();
+        pso_cache_put(&oldest_key, oldest, 8);
+        for i in 0..max {
+            pso_cache_put(&format!("pso-cache-evict-test/{i}"), fake_pso(), 8);
+        }
+        let mut out: *mut c_void = std::ptr::null_mut();
+        assert!(!pso_cache_get(&oldest_key, &mut out as *mut *mut c_void), "the oldest entry was evicted");
+        assert_eq!(refs(oldest), 1, "the evicted entry's reference was released");
+        let newest = format!("pso-cache-evict-test/{}", max - 1);
+        assert!(pso_cache_get(&newest, &mut out as *mut *mut c_void), "the recent entries are kept");
+        let len = PSO_CACHE.lock().unwrap().as_ref().map_or(0, |m| m.len());
+        assert!(len <= max, "the cache never holds more than the limit ({len} > {max})");
     }
 }
 
@@ -6563,9 +6788,14 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     };
     let _ = &blob_stream; // alive until the driver call below reads `desc`
     // one compile per stream: a second requester waits for the first one's mesh PSO (no turn,
-    // no metrics, no driver call) and shares its pipeline object
+    // no metrics, no driver call) and shares its pipeline object. A stream whose pipeline is
+    // already kept in the PSO cache is handed back at once (no turn, no metrics, no driver
+    // call) and counts as a reuse.
     let mflight = mkey.map(|(h, b)| mesh_compile_key(kind, h, b));
-    let entered = mflight.as_deref().map(|k| enter_in_flight(k, ppv));
+    let entered = match mflight.as_deref() {
+        Some(k) if pso_cache_get(k, ppv) => Some(Err(S_OK)),
+        k => k.map(|k| enter_in_flight(k, ppv)),
+    };
     let mut turn: Option<SlotGuard> = None;
     let hr = match &entered {
         Some(Err(shared)) => *shared,
@@ -6610,6 +6840,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             }
             if let (Some(k), Some(Ok(f))) = (mflight.as_deref(), &entered) {
                 publish_in_flight(k, f, hr, ppv);
+                // the built mesh pipeline is kept for later requests of the same stream
+                if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+                    pso_cache_put(k, *ppv, stream.shader_bytes());
+                }
             }
             hr
         }
@@ -6720,11 +6954,20 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
+    // the compute pass's object-cache key (the same identity a standalone compute compile of
+    // `tp.cs` uses); a cache hit never waits, so it cannot deadlock the gate the way an
+    // in-flight join could – hence still no in-flight key here, as before
+    let cobj = compute_compile_key(&tp.cs, rs as usize, 0, false);
+    let compute_kept = pso_cache_get(&cobj, &mut compute as *mut *mut c_void);
     // no in-flight key here: this caller may hold the turn above, and joining a compile whose
     // first requester waits for a slot would deadlock the gate
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
-        driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
-    });
+    let (mut hc, mut cin_driver) = if compute_kept {
+        (S_OK, std::time::Duration::ZERO)
+    } else {
+        driver_compile_identified("compute pass", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
+            driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+        })
+    };
     if hc < 0 && ccached.is_some() {
         forget_compute_blob(ckey);
         if cfrom_disk {
@@ -6745,6 +6988,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
             driver_cache::keep(p, &b, cin_driver);
         }
+        pso_cache_put(&cobj, compute, tp.cs.len());
     } else if creused && cfrom_disk {
         driver_cache::note(true, None);
     }
