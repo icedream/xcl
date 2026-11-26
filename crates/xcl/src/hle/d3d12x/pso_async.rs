@@ -29,6 +29,9 @@ struct Pending {
     used: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
+    /// its build is in the open count (`PENDING_OPEN`) – set when the build is handed off,
+    /// cleared with the count again, so a stand-in that reached no pool is not counted
+    counted: std::sync::atomic::AtomicBool,
     /// a bind waited for it longer than `wait_budget`: binds go on without it until it is built
     late: std::sync::atomic::AtomicBool,
     /// its dispatches may be left out while it is built (`image_only`): binds do not wait for it
@@ -118,7 +121,11 @@ impl Pending {
 
 /// stand-in handed to the title → its real pipeline
 static PENDING: Mutex<Option<HashMap<usize, Arc<Pending>>>> = Mutex::new(None);
-/// stand-ins whose real pipeline is not built yet (`counts`)
+/// stand-ins whose build is with the workers or the preloader and is not done yet (`counts`).
+/// A stand-in counts from the moment its build is handed off – created and sent (`submit`),
+/// a lazy one's first bind, the submit that needs it, an earlier run's use – not from its
+/// registration, because then its job is with nobody: a title that registers a pipeline it
+/// never uses is not waiting for a build, and must not read as `pipelines queued`.
 static PENDING_OPEN: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
@@ -180,7 +187,7 @@ fn complete(p: &Pending, real: usize) {
         if !orphan {
             p.real.store(real, Ordering::Release);
         }
-        if !*done {
+        if !*done && p.counted.swap(false, Ordering::AcqRel) {
             PENDING_OPEN.fetch_sub(1, Ordering::Relaxed);
         }
         *done = true;
@@ -327,13 +334,22 @@ fn next_needed() -> Option<Arc<Pending>> {
     NEEDED.lock().unwrap().pop_front()
 }
 
+/// Add `p` to the open count, once: a stand-in counts as `pipelines queued` only once its
+/// build is handed off, and becomes eligible for the single decrement when its build ends.
+fn count_open(p: &Pending) {
+    let done = p.done.lock().unwrap();
+    if !*done && !p.counted.swap(true, Ordering::AcqRel) {
+        PENDING_OPEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Drop an unstarted orphaned job outside all locks and wake any concurrent waiter.
 fn drop_unstarted_job(p: &Pending) {
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
         {
             let mut done = p.done.lock().unwrap();
-            if !*done {
+            if !*done && p.counted.swap(false, Ordering::AcqRel) {
                 PENDING_OPEN.fetch_sub(1, Ordering::Relaxed);
             }
             *done = true;
@@ -451,20 +467,22 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         key,
         used: Default::default(),
         orphan: Default::default(),
+        counted: Default::default(),
         late: Default::default(),
         spared: Default::default(),
         demand: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
-    PENDING_OPEN.fetch_add(1, Ordering::Relaxed);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
+        count_open(&p);
         enqueue(p);
     } else if used::known(key) {
         if let Some(q) = preload() {
+            count_open(&p);
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
         }
@@ -1149,6 +1167,7 @@ pub fn resolve(pso: usize) -> usize {
             // a lazy one is wanted now: to the workers
             let stand = p.stand(pso);
             if !p.sent.swap(true, Ordering::AcqRel) {
+                count_open(&p);
                 enqueue(p);
             }
             stand
@@ -1214,6 +1233,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
         return built(p);
     }
     if !p.sent.swap(true, Ordering::AcqRel) {
+        count_open(&p);
         enqueue(p.clone());
     }
     if p.late.load(Ordering::Acquire) {
@@ -1262,6 +1282,7 @@ fn resolve_spared(p: &Arc<Pending>, pso: usize) -> usize {
     match p.real.load(Ordering::Acquire) {
         0 => {
             if !p.sent.swap(true, Ordering::AcqRel) {
+                count_open(&p);
                 enqueue(p.clone());
             }
             if !*p.done.lock().unwrap() && !p.late.swap(true, Ordering::AcqRel) {
@@ -1319,12 +1340,13 @@ pub fn want(pso: usize) {
 pub fn need_by_submit(pso: usize) {
     let Some(p) = entry(pso) else { return };
     if !std::mem::replace(&mut p.demand.lock().unwrap().by_submit, true) {
+        count_open(&p);
         NEEDED.lock().unwrap().push_back(p);
         let _ = queue().lock().unwrap().send(Box::new(|| ()));
     }
 }
 
-/// (built in the background, failed, still building)
+/// (built in the background, failed, with the workers: handed off and not done yet)
 pub fn counts() -> (usize, usize, usize) {
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), PENDING_OPEN.load(Ordering::Relaxed))
 }
@@ -1333,17 +1355,19 @@ pub fn counts() -> (usize, usize, usize) {
 mod counts_tests {
     use super::*;
 
-    /// the open-pending counter tracks stand-ins whose real pipeline is not built yet: it
-    /// rises by one on a registration and falls by one on a build's end – a failed one
-    /// (real == 0) included – so `counts` is constant time and takes no `PENDING` lock.
+    /// the open-pending counter tracks stand-ins whose build was handed off and is not done
+    /// yet: it rises when the job reaches a worker (or the preloader, or the submit's need) and
+    /// falls when the build ends or the stand-in's unstarted job drops, a failed build
+    /// (real == 0) included, so `counts` is constant time and takes no `PENDING` lock. A
+    /// stand-in nobody asked for yet (a lazy one of an empty earlier-`used` set) is not counted.
     #[test]
     fn the_open_counter_tracks_stand_ins_not_built_yet() {
-        // the invariant: the counter equals the number of stand-ins not built yet. the binds
-        // below wait out the build (a worker runs it), so their stand-ins end when they return;
-        // the snapshot retries until no other test's build ends mid-scan.
+        // the invariant: the counter equals the number of handed-off stand-ins not built yet.
+        // the binds below wait out the build (a worker runs it), so their stand-ins end when they
+        // return; the snapshot retries until no other test's build ends mid-scan.
         let snap = || loop {
             let o1 = PENDING_OPEN.load(Ordering::Relaxed);
-            let s = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
+            let s = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| p.counted.load(Ordering::Acquire) && !*p.done.lock().unwrap()).count());
             let o2 = PENDING_OPEN.load(Ordering::Relaxed);
             if o1 == o2 {
                 assert_eq!(o1, s, "the open counter equals the number not built yet");
@@ -1362,7 +1386,8 @@ mod counts_tests {
         assert_eq!(mine(), 5, "five registered, all not built yet");
         snap();
 
-        // a successful build lowers the count
+        // the five were handed to nobody (an empty earlier-`used` set, no bind yet): a handed-off
+        // build takes each of them into the count and its end takes it out again
         assert_eq!(resolve_wait_for(standins[0], NO_LIMIT), 0x1234);
         assert_eq!(mine(), 4, "a successful build ends its stand-in");
         snap();
@@ -1380,6 +1405,115 @@ mod counts_tests {
         assert_eq!(released(standins[0]), 0x1234);
         assert_eq!(released(standins[1]), 0);
         assert_eq!(mine(), 0, "all released, none of these are pending");
+        snap();
+    }
+
+    /// A stand-in nobody asked for yet (a lazy one of an empty earlier-`used` set, as a title
+    /// registers thousands while it loads and binds some) was counted as "pipelines queued"
+    /// from its registration, although its job was handed to no worker: the overlay showed a
+    /// run stuck at `0 running, 0 done, 55 846 pipelines queued` forever. Registering one must
+    /// not put it in the open count; its first use is what takes it into the count, and the
+    /// build's end takes it out again.
+    #[test]
+    fn a_stand_in_nobody_uses_yet_is_not_counted_as_queued() {
+        const STANDINS: usize = 2000;
+        let first = 0x7E57_F100usize;
+        assert!(!is_pending(first));
+        for s in first..first + STANDINS {
+            submit_lazy(s, false, Box::new(|| 0xF101), 0);
+        }
+        // registered and pending, every one, but in the open (queued) count none: their
+        // builds were handed to no worker yet
+        let (pending, open) = {
+            let g = PENDING.lock().unwrap();
+            let empty = HashMap::new();
+            let m = g.as_ref().unwrap_or(&empty);
+            (first..first + STANDINS).fold((0, 0), |(p, o), s| match m.get(&s) {
+                Some(e) if !*e.done.lock().unwrap() => (p + 1, o + e.counted.load(Ordering::Acquire) as usize),
+                _ => (p, o),
+            })
+        };
+        assert_eq!(pending, STANDINS, "all registered, unbuilt");
+        assert_eq!(open, 0, "stand-ins nobody uses yet are in the queued count");
+
+        // the first use hands the build to the workers: now it counts, until the build is done
+        assert_eq!(resolve_wait_for(first, NO_LIMIT), 0xF101, "used once, its build runs on a worker");
+        assert!(!is_pending(first), "the build ended its stand-in");
+
+        assert_eq!(released(first), 0xF101, "its real pipeline goes with the stand-in");
+        for s in first + 1..first + STANDINS {
+            assert_eq!(released(s), 0, "never built, there is no real pipeline to return");
+        }
+    }
+
+    /// Registers stand-ins every way a session does: sent at once, lazy ones the title binds,
+    /// lazy ones a deferred dispatch needs, lazy ones of an earlier run's shaders, and ones the
+    /// title releases on another thread. Every stand-in whose build was supposed to start must
+    /// reach a worker exactly once and finish (built or failed), and the open-stand-in counter
+    /// must stay equal to how many are not built yet.
+    #[test]
+    fn a_busy_session_builds_every_stand_in_that_was_asked_for() {
+        const ROUNDS: usize = 16;
+
+        let snap = || loop {
+            let o1 = PENDING_OPEN.load(Ordering::Relaxed);
+            let s = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| p.counted.load(Ordering::Acquire) && !*p.done.lock().unwrap()).count());
+            let o2 = PENDING_OPEN.load(Ordering::Relaxed);
+            if o1 == o2 {
+                assert_eq!(o1, s, "the open counter equals the number not built yet");
+                return;
+            }
+        };
+
+        let build = |result| Box::new(move || result) as Job;
+        for k in 0..ROUNDS {
+            let base = 0x7E57_D000usize + k * 0x100;
+            let (sent, bound, needed, known, gone) = (base, base + 1, base + 2, base + 3, base + 4);
+            let key = 0x5EED_D000 + k as u64;
+            used::earlier_run_used(key);
+            submit(sent, false, build(base + 0x21));                                     // to the queue at once
+            submit_lazy(bound, false, build(base + 0x22), 0);                           // built on its first bind
+            submit_lazy(needed, true, build(base + 0x23), 0);                           // built by the submit's need
+            submit_lazy(known, false, build(base + 0x24), key);                        // built ahead by the preload
+            submit_lazy(gone, false, build(base + 0x25), 0);                           // released unbuilt
+
+            // the title's threads: bind, need for a submit, release, concurrently
+            let threads = [
+                std::thread::spawn(move || {
+                    let _ = resolve_wait_for(bound, NO_LIMIT);
+                }),
+                std::thread::spawn(move || {
+                    need_by_submit(needed);
+                    need_by_submit(needed);
+                    let _ = resolve_wait_for(needed, NO_LIMIT);
+                }),
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    let _ = released(gone);
+                }),
+            ];
+            assert_eq!(resolve_wait_for(sent, NO_LIMIT), base + 0x21, "a sent stand-in was built");
+            for t in threads {
+                t.join().unwrap();
+            }
+            let start = std::time::Instant::now();
+            while [bound, needed].iter().any(|&s| is_pending(s)) && start.elapsed() < std::time::Duration::from_secs(30) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                snap();
+            }
+            for &s in &[bound, needed] {
+                assert!(!is_pending(s), "a stand-in a bind or a submit waited for is still not built {s:#x}");
+            }
+            let start = std::time::Instant::now();
+            while is_pending(known) && start.elapsed() < std::time::Duration::from_secs(30) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(!is_pending(known), "a stand-in of an earlier run's shaders is still not built");
+            snap();
+            for &s in &[sent, bound, needed] {
+                let _ = released(s);
+            }
+        }
         snap();
     }
 }
