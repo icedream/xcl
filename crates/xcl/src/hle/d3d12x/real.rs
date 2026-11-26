@@ -4261,12 +4261,118 @@ fn compile_slots(bytes: usize) -> &'static Slots {
     if bytes >= GIANT_DRIVER_COMPILE { &GIANT_COMPILES } else { &BIG_COMPILES }
 }
 
+/// An id of the adapter the device runs on (its LUID), for cache keys that must not cross
+/// adapters; 0 when unknown.
+fn driver_id() -> u64 {
+    static ID: OnceLock<u64> = OnceLock::new();
+    *ID.get_or_init(|| {
+        let raw = device_raw();
+        if raw.is_null() {
+            return 0;
+        }
+        unsafe { ID3D12Device::from_raw_borrowed(&raw) }.map_or(0, |dev| {
+            let l = unsafe { dev.GetAdapterLuid() };
+            ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64
+        })
+    })
+}
+
+/// A driver compile in flight: its outcome, published by the first requester when its driver
+/// call returns. Whoever asks for the same work meanwhile waits on `done` and shares the
+/// pipeline object the first one built.
+#[derive(Default)]
+struct InFlight {
+    outcome: Mutex<Option<(HRESULT, *mut c_void)>>,
+    done: std::sync::Condvar,
+}
+
+// the pipeline pointer is only read and AddRef'd, never dereferenced as an object here
+unsafe impl Send for InFlight {}
+unsafe impl Sync for InFlight {}
+
+/// Driver compiles in flight, by `compile_key`: one compile per program; a second requester
+/// for the same work waits for the first one's result instead of calling the driver again.
+static IN_FLIGHT: Mutex<Option<HashMap<String, std::sync::Arc<InFlight>>>> = Mutex::new(None);
+
+/// Enter the in-flight map for `key`: `Ok(flight)` when this caller is the one to compile (it
+/// must then publish with `publish_in_flight`), `Err(hr)` when another caller's compile was
+/// joined – its outcome, with its pipeline object AddRef'd into `ppv` on success. The map's
+/// lock is never held across a driver call, and a joining caller holds no compile slot.
+fn enter_in_flight(key: &str, ppv: *mut *mut c_void) -> Result<std::sync::Arc<InFlight>, HRESULT> {
+    enum Entered {
+        Wait(std::sync::Arc<InFlight>),
+        First(std::sync::Arc<InFlight>),
+    }
+    let entered = {
+        let mut m = IN_FLIGHT.lock().unwrap();
+        let map = m.get_or_insert_with(HashMap::new);
+        match map.get(key) {
+            Some(f) => Entered::Wait(f.clone()),
+            None => {
+                let f = std::sync::Arc::new(InFlight::default());
+                map.insert(key.to_string(), f.clone());
+                Entered::First(f)
+            }
+        }
+    };
+    match entered {
+        Entered::First(f) => Ok(f),
+        Entered::Wait(wait) => {
+            let mut g = wait.outcome.lock().unwrap();
+            while g.is_none() {
+                g = wait.done.wait(g).unwrap();
+            }
+            let (hr, pso) = g.unwrap();
+            if hr >= 0 && !pso.is_null() {
+                unsafe {
+                    // the first requester's pipeline object, one more reference for this caller
+                    let add: RefFn = std::mem::transmute(*vt(pso).add(1));
+                    add(pso);
+                    if !ppv.is_null() {
+                        *ppv = pso;
+                    }
+                }
+            }
+            Err(hr)
+        }
+    }
+}
+
+/// Publish the outcome of the compile `flight` was entered for, and wake its waiters.
+fn publish_in_flight(key: &str, flight: &std::sync::Arc<InFlight>, hr: HRESULT, ppv: *mut *mut c_void) {
+    let pso = if hr >= 0 && !ppv.is_null() { unsafe { *ppv } } else { std::ptr::null_mut() };
+    *flight.outcome.lock().unwrap() = Some((hr, pso));
+    if let Some(map) = IN_FLIGHT.lock().unwrap().as_mut() {
+        map.remove(key);
+    }
+    flight.done.notify_all();
+}
+
+/// The in-flight identity of a compute-style compile: the blob cache's own name of the DXIL
+/// and its flags (`driver_cache::name_for`), with the pipeline kind and the root signature
+/// the blob key (`compute_blob_key`) also carries.
+fn compute_compile_key(dxil: &[u8], rs: usize, flags: i32, chained: bool) -> String {
+    format!("compute/{}/rs {rs:x}", driver_cache::name_for(dxil, flags, chained))
+}
+
+/// The in-flight identity of a graphics compile: the blob cache's `graphics_name` of the
+/// pipeline's full state and shader digest, with the pipeline kind.
+fn graphics_compile_key(hash: u64, bytes: usize) -> String {
+    format!("graphics/{}", driver_cache::graphics_name(hash, bytes))
+}
+
+/// The in-flight identity of a two-pass (mesh/GS) compile: the canonical stream key
+/// (`two_pass_identity::two_pass_stream_key`) as a `mesh_name`, with the pipeline kind.
+fn mesh_compile_key(kind: &str, hash: u64, bytes: usize) -> String {
+    format!("{kind}/{}", driver_cache::mesh_name(hash, bytes))
+}
+
 /// A driver compile of `bytes` of DXIL through `build`: a huge one on an `xcl-pso*` worker
 /// waits for its slot first (`big_compile_turn`; not a title thread's, nor one the title waits
 /// for). Logs its time, size and whether it was gated.
 #[cfg(test)]
 fn driver_compile<R>(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> R) -> R {
-    driver_compile_identified(kind, bytes, gate, None, build).0
+    driver_compile_identified(kind, bytes, gate, None, None, std::ptr::null_mut(), build).0
 }
 
 /// `XCL_SKIP_BIG_DXIL=<bytes>`: do not hand the driver a compute program above that much DXIL.
@@ -4283,8 +4389,17 @@ fn pso_trace() -> bool {
 
 /// A timed driver compile with the console record's hash (`fnv64` of the shader container, as in
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
-/// Also returns the time spent in the driver alone (not waiting for a slot).
-fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> HRESULT) -> (HRESULT, std::time::Duration) {
+/// Also returns the time spent in the driver alone (not waiting for a slot). `key`: the
+/// in-flight identity of the work – a program already being compiled is not compiled again,
+/// the second requester waits for the first one's result (`ppv` gets its pipeline object).
+fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, key: Option<String>, ppv: *mut *mut c_void, build: impl FnOnce() -> HRESULT) -> (HRESULT, std::time::Duration) {
+    // the same program is already being compiled: wait for that compile and share its result
+    // instead of starting a second one (no slot, no metrics, no driver call – a batch of
+    // identical requests counts as the one compile)
+    let flight = key.as_deref().map(|k| enter_in_flight(k, ppv));
+    if let Some(Err(hr)) = &flight {
+        return (*hr, std::time::Duration::ZERO);
+    }
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let _slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
@@ -4308,6 +4423,9 @@ fn driver_compile_identified(kind: &str, bytes: usize, gate: bool, record: Optio
     super::metrics::compile_done(took, r < 0);
     if log {
         crate::xlog_info!("D3D12.X: driver compile finish #{sequence}: {kind} PSO, {bytes} B DXIL, {} ms{}", took.as_millis(), gate_note(bytes >= huge_pso_bytes(), huge, waited));
+    }
+    if let (Some(k), Some(Ok(f))) = (key.as_deref(), &flight) {
+        publish_in_flight(k, f, r, ppv);
     }
     (r, took)
 }
@@ -4696,6 +4814,7 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(dxil, rs as usize, copy.Flags.0);
+    let flight_key = compute_compile_key(dxil, rs as usize, copy.Flags.0, mode == ComputeBuild::Chain);
     let mut cached = compute_blob(key);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
     let disk = driver_cache::path_for(dxil, copy.Flags.0, mode == ComputeBuild::Chain);
@@ -4714,6 +4833,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
         dxil.len(),
         gate_compute_driver_compile(cached.is_some()),
         Some((record, cached.is_some())),
+        Some(flight_key.clone()),
+        ppv,
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
     if hr < 0 && cached.is_some() {
@@ -4731,6 +4852,8 @@ unsafe fn compute_container(this: *mut c_void, f: PsoFn, d: &D3D12_COMPUTE_PIPEL
             dxil.len(),
             gate_compute_driver_compile(false),
             Some((record, false)),
+            Some(flight_key),
+            ppv,
             || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
         );
         hr = retried;
@@ -4798,6 +4921,12 @@ pub(crate) mod driver_cache {
         format!("gfx-{hash:016x}-{bytes:x}.pso")
     }
 
+    /// The file of a translated two-pass (mesh) pipeline keyed by its canonical stream key
+    /// (`two_pass_identity::two_pass_stream_key`).
+    pub fn mesh_name(hash: u64, bytes: usize) -> String {
+        format!("mesh-{hash:016x}-{bytes:x}.pso")
+    }
+
     fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
@@ -4813,6 +4942,10 @@ pub(crate) mod driver_cache {
 
     pub fn graphics_path(hash: u64, bytes: usize) -> Option<PathBuf> {
         enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(graphics_name(hash, bytes)))
+    }
+
+    pub fn mesh_path(hash: u64, bytes: usize) -> Option<PathBuf> {
+        enabled().then(|| crate::gpu::recomp::dxc::cache_dir().join("driver").join(mesh_name(hash, bytes)))
     }
 
     pub fn load(p: &Path) -> Option<Vec<u8>> {
@@ -5067,6 +5200,60 @@ mod compute_blob_tests {
     }
 }
 
+#[cfg(test)]
+mod compile_key_tests {
+    use super::*;
+
+    #[test]
+    fn identical_requests_produce_one_compile_key_and_different_flags_another() {
+        let dxil = vec![7u8; 4096];
+        let a = compute_compile_key(&dxil, 0x1000, 0, false);
+        assert_eq!(a, compute_compile_key(&dxil.clone(), 0x1000, 0, false));
+        assert_ne!(a, compute_compile_key(&dxil, 0x1000, 1, false), "different flags");
+        assert_ne!(a, compute_compile_key(&dxil, 0x2000, 0, false), "a different root signature");
+        assert_ne!(a, compute_compile_key(&dxil, 0x1000, 0, true), "the chain namespace");
+        let mut other = dxil.clone();
+        other[0] ^= 1;
+        assert_ne!(a, compute_compile_key(&other, 0x1000, 0, false), "a different program");
+        let g = graphics_compile_key(0xabc, 4096);
+        assert_eq!(g, graphics_compile_key(0xabc, 4096));
+        assert_ne!(g, graphics_compile_key(0xabc, 4097));
+        assert_ne!(g, graphics_compile_key(0xabd, 4096));
+        assert_ne!(a, g, "the pipeline kinds never share a compile");
+        let m = mesh_compile_key("MS", 0xabc, 4096);
+        assert_eq!(m, mesh_compile_key("MS", 0xabc, 4096));
+        assert_ne!(m, mesh_compile_key("GS", 0xabc, 4096), "MS and GS pipelines differ");
+    }
+
+    #[test]
+    fn an_in_flight_compile_is_entered_once_and_its_outcome_is_shared() {
+        let key = compute_compile_key(b"program", 0x1000, 0, false);
+        let first = std::thread::spawn({
+            let key = key.clone();
+            move || match enter_in_flight(&key, std::ptr::null_mut()) {
+                Ok(f) => {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    publish_in_flight(&key, &f, S_OK, std::ptr::null_mut());
+                    "compiled"
+                }
+                Err(hr) => panic!("the first requester compiles, it does not join ({hr:#x})"),
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut out: *mut c_void = std::ptr::null_mut();
+        match enter_in_flight(&key, &mut out as *mut *mut c_void) {
+            Err(hr) => assert_eq!(hr, S_OK, "the waiter gets the first requester's verdict"),
+            Ok(_) => panic!("the second requester must join the in-flight compile"),
+        }
+        assert_eq!(first.join().unwrap(), "compiled");
+        // the entry is gone once published: the next requester compiles again
+        match enter_in_flight(&key, &mut out as *mut *mut c_void) {
+            Ok(f) => publish_in_flight(&key, &f, S_OK, std::ptr::null_mut()),
+            Err(hr) => panic!("a published compile is no longer in flight ({hr:#x})"),
+        }
+    }
+}
+
 /// Read `GetCachedBlob` from either an adopted or raw PC `ID3D12PipelineState`.
 unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     if pso.is_null() {
@@ -5143,6 +5330,37 @@ fn remember_graphics_blob(key: (u64, usize), blob: std::sync::Arc<Vec<u8>>) {
     }
     *total += blob.len();
     blobs.insert(key, blob);
+}
+
+/// The driver's compiled form of translated two-pass (mesh) pipelines (`GetCachedBlob`),
+/// keyed by the canonical stream key, up to `MESH_BLOBS_MAX`.
+static MESH_BLOBS: Mutex<Option<(HashMap<(u64, usize), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const MESH_BLOBS_MAX: usize = 256 << 20;
+
+fn mesh_blob(key: (u64, usize)) -> Option<std::sync::Arc<Vec<u8>>> {
+    MESH_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_mesh_blob(key: (u64, usize)) {
+    if let Some((m, total)) = MESH_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+unsafe fn keep_mesh_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || mesh_blob(key).is_some() {
+        return;
+    }
+    let Some(bytes) = read_pso_cached_blob(pso) else { return };
+    let mut g = MESH_BLOBS.lock().unwrap();
+    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+    if bytes.is_empty() || *total + bytes.len() > MESH_BLOBS_MAX {
+        return;
+    }
+    *total += bytes.len();
+    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -5566,6 +5784,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
         }
     }
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
+    let gflight = graphics_compile_key(gkey.0, gkey.1);
     let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
     let from_disk = cached.is_none();
@@ -5584,7 +5803,7 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 driver_cache::note(false, disk.as_deref());
             }
         },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), Some(gflight.clone()), ppv, f),
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
@@ -6293,7 +6512,7 @@ fn passthrough_mesh_stream_accepts_a_triangle_driver_blob() {
     }
 }
 
-#[allow(dead_code)] // Consumed by the stacked driver-cache integration.
+#[allow(dead_code)] // two_pass_cs_key waits for the stacked driver-cache integration
 mod two_pass_identity;
 
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
@@ -6333,6 +6552,71 @@ fn two_pass_driver_id(device: *mut c_void) -> Option<u64> {
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     if ppv.is_null() {
+        Some(b) => {
+            blob_stream = stream.0.clone();
+            let mut extra = StreamOut::default();
+            extra.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
+            blob_stream.extend_from_slice(&extra.0);
+            [blob_stream.len(), blob_stream.as_ptr() as usize]
+        }
+        None => [stream.0.len(), stream.0.as_ptr() as usize],
+    };
+    let _ = &blob_stream; // alive until the driver call below reads `desc`
+    // one compile per stream: a second requester waits for the first one's mesh PSO (no turn,
+    // no metrics, no driver call) and shares its pipeline object
+    let mflight = mkey.map(|(h, b)| mesh_compile_key(kind, h, b));
+    let entered = mflight.as_deref().map(|k| enter_in_flight(k, ppv));
+    let mut turn: Option<SlotGuard> = None;
+    let hr = match &entered {
+        Some(Err(shared)) => *shared,
+        _ => {
+            // the mesh pass and its compute pass: one turn for both
+            let bytes = stream.shader_bytes() + tp.cs.len();
+            let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+            let waited = std::time::Instant::now();
+            turn = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+            if gate {
+                let waited = waited.elapsed();
+                super::metrics::gate_wait(waited);
+                crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.as_millis());
+            }
+            let started = std::time::Instant::now();
+            let mut hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+            let mut in_driver = started.elapsed();
+            if hr < 0 && mcached.is_some() {
+                // a blob the driver does not take (another driver or adapter…): dropped, and
+                // the pipeline compiled again without it
+                if let Some(k) = mkey {
+                    forget_mesh_blob(k);
+                }
+                if mfrom_disk {
+                    driver_cache::note(false, mdisk.as_ref().and_then(|p| p.as_deref()));
+                }
+                let plain: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
+                let retry_started = std::time::Instant::now();
+                hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, plain.as_ptr() as *const c_void, riid, ppv));
+                in_driver += retry_started.elapsed();
+            }
+            let mreused = hr >= 0 && mcached.is_some();
+            if hr >= 0 && !mreused && !ppv.is_null() && !(*ppv).is_null() {
+                if let Some(k) = mkey {
+                    keep_mesh_blob(k, *ppv, stream.shader_bytes());
+                    if let (Some(p), Some(b)) = (mdisk.as_ref().and_then(|p| p.as_deref()), mesh_blob(k)) {
+                        driver_cache::keep(p, &b, in_driver);
+                    }
+                }
+            } else if mreused && mfrom_disk {
+                driver_cache::note(true, None);
+            }
+            if let (Some(k), Some(Ok(f))) = (mflight.as_deref(), &entered) {
+                publish_in_flight(k, f, hr, ppv);
+            }
+            hr
+        }
+    };
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
+>>>>>>> 1deeb8c (d3d12x: single-flight driver compiles, cache two-pass mesh PSO blobs)
         return E_INVALIDARG;
     }
     *ppv = std::ptr::null_mut();
@@ -6436,7 +6720,9 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    // no in-flight key here: this caller may hold the turn above, and joining a compile whose
+    // first requester waits for a slot would deadlock the gate
+    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
     if hc < 0 && ccached.is_some() {
@@ -6447,7 +6733,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         take_cold_slot();
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
-        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
+        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
             driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
         });
         hc = retried;
