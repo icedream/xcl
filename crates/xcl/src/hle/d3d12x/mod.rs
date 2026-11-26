@@ -36,6 +36,8 @@ pub mod title_textures;
 mod uma_driver;
 pub mod vram;
 
+pub(crate) use fence_x::note_mwaitx;
+
 use std::ffi::c_void;
 use std::sync::OnceLock;
 

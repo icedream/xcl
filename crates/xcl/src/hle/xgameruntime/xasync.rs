@@ -122,6 +122,14 @@ pub struct State {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `XAsyncGetStatus(wait=true)` calls that waited over 5 s and were logged (the metrics line).
+static LONG_WAITS: AtomicU64 = AtomicU64::new(0);
+
+/// `XAsyncGetStatus(wait=true)` waits logged as over 5 s (the metrics line).
+pub(crate) fn long_waits() -> u64 {
+    LONG_WAITS.load(Ordering::Relaxed)
+}
+
 fn active_map() -> &'static Mutex<HashMap<usize, Arc<State>>> {
     static ACTIVE: OnceLock<Mutex<HashMap<usize, Arc<State>>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -335,8 +343,23 @@ pub unsafe extern "system" fn XAsyncGetStatus(b: *mut XAsyncBlock, wait: bool) -
         Lookup::Active(s) => {
             let mut g = s.inner.lock().unwrap();
             if wait {
+                // still no bound on the wait itself; a wait over 5 s is logged once per call
+                let started = std::time::Instant::now();
+                let mut warned = false;
                 while !g.is_done() {
-                    g = s.cv.wait(g).unwrap();
+                    let (guard, _) = s.cv.wait_timeout(g, std::time::Duration::from_secs(5)).unwrap();
+                    g = guard;
+                    if !warned && started.elapsed() >= std::time::Duration::from_secs(5) {
+                        warned = true;
+                        LONG_WAITS.fetch_add(1, Ordering::Relaxed);
+                        crate::xlog_warn!(
+                            "XGameRuntime: XAsyncGetStatus(wait) on block {:#x} (id {}) still {:#x} after {:.1} s",
+                            b as usize,
+                            s.id,
+                            g.status,
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
                 }
             }
             if g.is_done() { g.status } else { E_PENDING }
@@ -572,6 +595,27 @@ mod tests {
     static DONE: AtomicU32 = AtomicU32::new(0);
     unsafe extern "system" fn on_done(_b: *mut XAsyncBlock) {
         DONE.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn get_status_wait_over_5s_is_counted_once_and_still_returns_the_status() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            let id = 0x5a5ausize;
+            assert_eq!(
+                begin_with(&mut b, id, || {
+                    std::thread::sleep(std::time::Duration::from_millis(6000));
+                    Ok(Vec::new())
+                }),
+                S_OK
+            );
+            let before = long_waits();
+            let t = std::time::Instant::now();
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            assert!(t.elapsed() >= std::time::Duration::from_secs(5), "returned after {:.1} s", t.elapsed().as_secs_f64());
+            assert_eq!(long_waits() - before, 1, "one warn per call, not one per wakeup");
+        }
     }
 
     #[test]

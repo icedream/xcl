@@ -350,6 +350,8 @@ unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics
         ConsoleOnly::Monitorx => {}
         ConsoleOnly::Mwaitx => {
             std::hint::spin_loop();
+            // the title parks on the monitored line: an armed fence wait that never advanced is reported
+            crate::hle::d3d12x::note_mwaitx(ctx.Rax);
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line

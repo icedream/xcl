@@ -39,6 +39,13 @@ pub struct Metrics {
     pub standins: u64,
     pub skipped_draws: u64,
     pub skipped_dispatches: u64,
+    /// `Write64BitValue*` signals skipped instead of written (value 0, not monotonic, already
+    /// submitted or satisfied) – each one is a waiter on that address left parked
+    pub write64_skips: u64,
+    /// fence-cell `mwaitx` waits armed but unmet for over 2 s (each logged once)
+    pub mwaitx_long_waits: u64,
+    /// `XAsyncGetStatus(wait=true)` calls waiting over 5 s (each logged once)
+    pub xasync_long_waits: u64,
     /// since the counters began (`start`)
     pub wall_ms: u64,
 }
@@ -163,6 +170,9 @@ pub fn snapshot() -> Metrics {
         standins: STANDINS.load(Ordering::Relaxed),
         skipped_draws,
         skipped_dispatches,
+        write64_skips: super::list_x::write64_skips(),
+        mwaitx_long_waits: super::fence_x::long_waits(),
+        xasync_long_waits: crate::hle::xgameruntime::xasync::long_waits(),
         wall_ms: since_epoch() / 1000,
     }
 }
@@ -180,10 +190,11 @@ fn secs(ms: u64) -> f64 {
 /// The metrics line's numbers, as `log` and `log_final` write them (the slots are
 /// `compiles_peak` of them, `slots_busy_pct` of the wall):
 /// `compiles 28 started/28 done/0 failed, driver 218.9 s over 162.0 s wall (slots 67% busy),
-/// presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41`
+/// presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41,
+/// write64-skips 0, mwaitx>2s 0, xasync>5s 0`
 fn line(m: &Metrics) -> String {
     format!(
-        "compiles {} started/{} done/{} failed, driver {:.1} s over {:.1} s wall (slots {}% busy), presents {}, longest present gap {:.1} s, gaps>1s {}, gaps>10s {}, stand-ins {}",
+        "compiles {} started/{} done/{} failed, driver {:.1} s over {:.1} s wall (slots {}% busy), presents {}, longest present gap {:.1} s, gaps>1s {}, gaps>10s {}, stand-ins {}, write64-skips {}, mwaitx>2s {}, xasync>5s {}",
         m.compiles_started,
         m.compiles_done,
         m.compiles_failed,
@@ -195,6 +206,9 @@ fn line(m: &Metrics) -> String {
         m.present_gaps_over_1s,
         m.present_gaps_over_10s,
         m.standins,
+        m.write64_skips,
+        m.mwaitx_long_waits,
+        m.xasync_long_waits,
     )
 }
 
@@ -264,7 +278,7 @@ mod tests {
         m.standins = 41;
         assert_eq!(
             line(&m),
-            "compiles 28 started/28 done/0 failed, driver 218.9 s over 162.0 s wall (slots 67% busy), presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41"
+            "compiles 28 started/28 done/0 failed, driver 218.9 s over 162.0 s wall (slots 67% busy), presents 2, longest present gap 41.2 s, gaps>1s 9, gaps>10s 3, stand-ins 41, write64-skips 0, mwaitx>2s 0, xasync>5s 0"
         );
     }
 

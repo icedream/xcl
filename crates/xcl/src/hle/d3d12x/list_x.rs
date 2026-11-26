@@ -1759,6 +1759,40 @@ fn note_write64_recorded(list: *mut c_void, va: u64, value: u64) {
     }
 }
 
+/// Skipped `Write64` signals per (address, reason) with their counts, and their total: a skipped
+/// signal leaves the title's waiter on that address parked with no log, so the first 8 of each
+/// (address, reason) and then every 1000th are warned with the running count.
+static WRITE64_SKIPS: Mutex<Vec<(u64, &'static str, u64)>> = Mutex::new(Vec::new());
+static WRITE64_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Count a `Write64` signal that was not written, per (address, reason); warn the first 8 of
+/// each and then every 1000th, with the count in the line.
+fn note_write64_skip(va: u64, reason: &'static str, detail: &str) {
+    WRITE64_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    let n = {
+        let mut all = WRITE64_SKIPS.lock().unwrap();
+        match all.iter_mut().find(|r| r.0 == va && r.1 == reason) {
+            Some(r) => {
+                r.2 += 1;
+                r.2
+            }
+            None => {
+                all.push((va, reason, 1));
+                1
+            }
+        }
+    };
+    if n <= 8 || n % 1000 == 0 {
+        let d = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+        crate::xlog_warn!("D3D12.X: Write64 to {va:#x} skipped ({reason}{d}) {n} so far");
+    }
+}
+
+/// Skipped `Write64` signals since the run began (the metrics line).
+pub(super) fn write64_skips() -> u64 {
+    WRITE64_SKIPPED.load(Ordering::Relaxed)
+}
+
 unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
     if queue.is_null() || pairs.is_empty() {
         return;
@@ -1770,6 +1804,7 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
     let mut max_by_va: Vec<(u64, u64)> = Vec::with_capacity(pairs.len());
     for &(va, val) in pairs {
         if val == 0 {
+            note_write64_skip(va, "value 0", "");
             continue;
         }
         if let Some(entry) = max_by_va.iter_mut().find(|e| e.0 == va) {
@@ -1781,19 +1816,26 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
     for (va, val) in max_by_va {
         let skip = {
             let g = SYNC_GRAPH.lock().unwrap();
-            g.as_ref()
-                .and_then(|gr| gr.cells.get(&va))
-                .is_some_and(|c| c.non_monotonic || c.submitted_max >= val)
+            match g.as_ref().and_then(|gr| gr.cells.get(&va)) {
+                Some(c) if c.non_monotonic => Some(("not monotonic", format!("current {:#x} wanted {val:#x}", c.submitted_max))),
+                Some(c) if c.submitted_max >= val => Some(("already submitted", String::new())),
+                _ => None,
+            }
         };
-        if skip {
+        if let Some((reason, detail)) = skip {
+            note_write64_skip(va, reason, &detail);
             continue;
         }
-        let Some(fence) = ensure_cell_fence(va, &dev, dev_raw) else { continue };
+        let Some(fence) = ensure_cell_fence(va, &dev, dev_raw) else {
+            note_write64_skip(va, "no cell fence", "");
+            continue;
+        };
         enum SignalAction {
             Skip,
             GpuSignal,
             CpuCycleBreak(Vec<(usize, bool)>),
         }
+        let mut skip_reason: Option<(&'static str, String)> = None;
         let action = {
             let mut g = SYNC_GRAPH.lock().unwrap();
             let graph = g.get_or_insert_with(SyncGraph::default);
@@ -1801,12 +1843,22 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                 Some(cell) => {
                     let completed = prune_completed_waits(cell);
                     if cell.non_monotonic || cell.device != dev_raw || val <= cell.submitted_max {
+                        skip_reason = Some(if cell.non_monotonic {
+                            ("not monotonic", format!("current {:#x} wanted {val:#x}", cell.submitted_max))
+                        } else if cell.device != dev_raw {
+                            ("device changed", format!("cell device {:#x} != queue's {dev_raw:#x}", cell.device))
+                        } else {
+                            ("already submitted", String::new())
+                        });
                         None
                     } else {
                         Some(completed)
                     }
                 }
-                None => None,
+                None => {
+                    skip_reason = Some(("no cell", String::new()));
+                    None
+                }
             };
             match eligible {
                 None => SignalAction::Skip,
@@ -1841,12 +1893,16 @@ unsafe fn signal_write64_pairs(queue: *mut c_void, pairs: &[(u64, u64)]) {
                             cell.submitted_signals.push(SubmittedSignal { val, queue: sig_q, seq: sig_seq });
                             SignalAction::GpuSignal
                         } else {
+                            skip_reason = Some(("already satisfied", format!("completed {completed:#x} / cpu-signaled {:#x} >= {val:#x}", cell.cpu_signaled_max)));
                             SignalAction::Skip
                         }
                     }
                 }
             }
         };
+        if let Some((reason, detail)) = skip_reason {
+            note_write64_skip(va, reason, &detail);
+        }
         match action {
             SignalAction::Skip => {}
             SignalAction::GpuSignal => {
@@ -6779,6 +6835,26 @@ mod tests {
                 "pipelined 3-queue chain with wait_seq > sig_seq must NOT be treated as a cycle"
             );
         }
+    }
+
+    /// Skipped `Write64` signals count per (address, reason) and in total, so a parked waiter's
+    /// address shows up with its reason and running count.
+    #[test]
+    fn write64_skips_count_per_address_and_reason() {
+        let cell = Box::new(AtomicU64::new(0));
+        let va = &*cell as *const AtomicU64 as u64;
+        let total_before = write64_skips();
+        let count = |a: u64, r: &'static str| {
+            WRITE64_SKIPS.lock().unwrap().iter().find(|x| x.0 == a && x.1 == r).map(|x| x.2).unwrap_or(0)
+        };
+        note_write64_skip(va, "value 0", "");
+        note_write64_skip(va, "value 0", "");
+        note_write64_skip(va, "already submitted", "");
+        note_write64_skip(va + 8, "value 0", "");
+        assert_eq!(count(va, "value 0"), 2);
+        assert_eq!(count(va, "already submitted"), 1);
+        assert_eq!(count(va + 8, "value 0"), 1);
+        assert_eq!(write64_skips() - total_before, 4);
     }
 
     /// Reproduces two real multi-queue hazards seen in retail titles:
