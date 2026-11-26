@@ -141,7 +141,8 @@ static FALLBACK_PSO: AtomicU64 = AtomicU64::new(0);
 static FAILED_PSO: AtomicU64 = AtomicU64::new(0);
 static FALLBACK_RS: AtomicU64 = AtomicU64::new(0);
 static TRANSLATED_PSO: AtomicU64 = AtomicU64::new(0);
-static TRANSLATE_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// (reason class, full message), at most `translation_error_limit()` entries
+static TRANSLATE_ERRORS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// XCL shader ABI root signature on the backend device (raw, kept for the process lifetime)
 static ABI_RS: AtomicUsize = AtomicUsize::new(0);
 
@@ -420,7 +421,7 @@ pub fn stats() -> D3d12Stats {
         uma_error: UMA_ERROR.lock().map(|e| e.clone()).unwrap_or_default(),
         uma_import_check: UMA_IMPORT_CHECK.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
-        translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
+        translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.iter().map(|(_, m)| m.clone()).collect()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
         dxil_cache: crate::gpu::recomp::dxc::cache_stats(),
     }
@@ -4032,6 +4033,50 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (r, missed)
 }
 
+/// `XCL_TRANSLATION_ERRORS=<n>`: how many distinct reason classes `note_translation_error`
+/// logs and keeps (default 200).
+fn translation_error_limit() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| parse_translation_error_limit(std::env::var("XCL_TRANSLATION_ERRORS").ok().as_deref()))
+}
+
+fn parse_translation_error_limit(v: Option<&str>) -> usize {
+    env_count(v, 200, 1, usize::MAX)
+}
+
+/// The budget key of a translation error: every hex run of 8 or more characters becomes `H`,
+/// so messages that differ only in a shader hash share one slot (the log line keeps the full
+/// message).
+fn translation_error_class(e: &str) -> String {
+    let mut out = String::with_capacity(e.len());
+    let mut pending: Vec<char> = Vec::new();
+    let mut collapsed = false;
+    for c in e.chars() {
+        if c.is_ascii_hexdigit() {
+            if collapsed {
+                continue;
+            }
+            pending.push(c);
+            if pending.len() == 8 {
+                out.push('H');
+                pending.clear();
+                collapsed = true;
+            }
+        } else {
+            if !collapsed {
+                out.extend(pending.drain(..));
+            }
+            pending.clear();
+            collapsed = false;
+            out.push(c);
+        }
+    }
+    if !collapsed {
+        out.extend(pending.drain(..));
+    }
+    out
+}
+
 fn note_translation_error(e: String) {
     // a refusal `with_switch_fallback` builds again in the switch form (it says so itself)
     if HEAP_WINDOW_OOM.with(|o| o.get()) {
@@ -4041,12 +4086,14 @@ fn note_translation_error(e: String) {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
     }
-    // each different reason once (the first five only hid a retail game's "mesh pipeline with
-    // AS" behind five earlier ones)
+    // each different reason class once, within the budget (counted with hex runs of 8+
+    // characters collapsed: 40 mesh refusals with 40 different hashes once filled the whole
+    // budget and hid every later reason)
+    let class = translation_error_class(&e);
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
-    if g.len() < 40 && !g.contains(&e) {
+    if g.len() < translation_error_limit() && !g.iter().any(|(c, _)| *c == class) {
         crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
-        g.push(e);
+        g.push((class, e));
     }
 }
 
@@ -6422,6 +6469,36 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+/// `XCL_MESH_MS_IN_AS`: `refuse` (or unset) refuses a console MS container found in the AS
+/// slot; `translate` takes it as the MS subobject, with no amplification stage.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MeshMsInAs {
+    Refuse,
+    Translate,
+}
+
+fn mesh_ms_in_as() -> MeshMsInAs {
+    static V: OnceLock<MeshMsInAs> = OnceLock::new();
+    *V.get_or_init(|| parse_mesh_ms_in_as(std::env::var("XCL_MESH_MS_IN_AS").ok().as_deref()))
+}
+
+fn parse_mesh_ms_in_as(v: Option<&str>) -> MeshMsInAs {
+    match v.map(str::trim) {
+        Some("translate") => MeshMsInAs::Translate,
+        _ => MeshMsInAs::Refuse,
+    }
+}
+
+/// `XCL_MESH_MS_IN_AS=translate`: the MS-in-AS pipeline is translated as a mesh pipeline
+/// without amplification – logged once per distinct shader hash.
+fn note_ms_in_as_translated(a: &[u8]) {
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    let hash = crate::gpu::shader::fnv64(a);
+    if SEEN.lock().unwrap().get_or_insert_with(HashSet::new).insert(hash) {
+        crate::xlog_info!("D3D12.X: mesh pipeline with its MS {hash:016x} in the AS slot – translated as a mesh pipeline without amplification (XCL_MESH_MS_IN_AS=translate)");
+    }
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
 unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
@@ -6443,13 +6520,22 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     // A console MS container in the AS slot and no MS subobject (a retail game's minimap
     // pipelines): refused. Translated as the mesh shader they are, the title rendered nothing
     // from then on (a black screen every run); refused, it goes on to its menus. What it
-    // expects of them is not known yet.
-    if let (None, Some(a)) = (ms_slot, as_slot) {
-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
-            return Some(E_INVALIDARG);
-        }
-    }
+    // expects of them is not known yet. `XCL_MESH_MS_IN_AS=translate` re-evaluates that now
+    // that the surrounding code has changed: the container is taken as the MS subobject, with
+    // no amplification stage.
+    let (ms_slot, as_slot) = match (ms_slot, as_slot) {
+        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => match mesh_ms_in_as() {
+            MeshMsInAs::Translate => {
+                note_ms_in_as_translated(a);
+                (Some(a), None)
+            }
+            MeshMsInAs::Refuse => {
+                note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+                return Some(E_INVALIDARG);
+            }
+        },
+        (ms, as_) => (ms, as_),
+    };
     let ms = ms_slot?;
     if !is_console(ms) {
         return None;
@@ -8844,6 +8930,45 @@ mod mesh_stream_tests {
             let hr = finish_two_pass(this, &stream, make_tp(), 0x1234_5678 as *mut c_void, &[], "MS", &iid, std::ptr::null_mut());
             assert_eq!(hr, E_INVALIDARG);
         }
+    }
+}
+
+#[cfg(test)]
+mod mesh {
+    use super::*;
+
+    /// `XCL_MESH_MS_IN_AS` refuses unless the value is exactly `translate`.
+    #[test]
+    fn mesh_ms_in_as_env_parser_refuses_unless_translate() {
+        assert_eq!(parse_mesh_ms_in_as(None), MeshMsInAs::Refuse);
+        assert_eq!(parse_mesh_ms_in_as(Some("")), MeshMsInAs::Refuse);
+        assert_eq!(parse_mesh_ms_in_as(Some("refuse")), MeshMsInAs::Refuse);
+        assert_eq!(parse_mesh_ms_in_as(Some("TRANSLATE")), MeshMsInAs::Refuse);
+        assert_eq!(parse_mesh_ms_in_as(Some("translate")), MeshMsInAs::Translate);
+        assert_eq!(parse_mesh_ms_in_as(Some(" translate ")), MeshMsInAs::Translate);
+    }
+
+    /// `XCL_TRANSLATION_ERRORS` defaults to 200, clamped to at least 1.
+    #[test]
+    fn translation_errors_env_parser_defaults_to_200() {
+        assert_eq!(parse_translation_error_limit(None), 200);
+        assert_eq!(parse_translation_error_limit(Some("")), 200);
+        assert_eq!(parse_translation_error_limit(Some("lots")), 200);
+        assert_eq!(parse_translation_error_limit(Some("500")), 500);
+        assert_eq!(parse_translation_error_limit(Some(" 500 ")), 500);
+        assert_eq!(parse_translation_error_limit(Some("0")), 1, "at least one class is logged");
+    }
+
+    /// Two refusal messages that differ only in the shader hash share one budget slot.
+    #[test]
+    fn translation_error_class_collapses_hex_runs_of_eight_or_more() {
+        let a = "mesh pipeline with its MS 0123456789abcdef in the AS slot – refused";
+        let b = "mesh pipeline with its MS ffff0000deadbeef in the AS slot – refused";
+        assert_eq!(translation_error_class(a), translation_error_class(b));
+        assert_eq!(translation_error_class(a), "mesh pipeline with its MS H in the AS slot – refused");
+        assert_eq!(translation_error_class("the driver rejected the mesh pipeline (0x88760b03)"), "the driver rejected the mesh pipeline (0xH)");
+        assert_eq!(translation_error_class("subobjects [0, 2, 25]"), "subobjects [0, 2, 25]", "decimal runs stay");
+        assert_eq!(translation_error_class("0x1234567"), "0x1234567", "seven hex digits stay");
     }
 }
 
