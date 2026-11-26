@@ -3,7 +3,7 @@ use super::{payload_shader, stream_subobjects};
 use windows::Win32::Graphics::Direct3D12::*;
 
 /// Bump on any change to two-pass cache key fields or ABI root-signature layout to invalidate stale disk entries.
-const TWO_PASS_CACHE_SCHEMA: u32 = 2;
+const TWO_PASS_CACHE_SCHEMA: u32 = 3;
 /// ABI root signature layout tag for two-pass pipelines (`graphics = true`: 6 root UAVs + directly indexed heaps + IA flag).
 const TWO_PASS_ABI_RS_TAG: u32 = 0x5253_0001;
 
@@ -48,6 +48,99 @@ fn samplers_hash_into(h: &mut Fnv64, samplers: &[crate::gpu::recomp::pso::Static
 unsafe fn read_state<T: Copy>(payload: &[u8]) -> Option<T> {
     let payload = payload.get(..std::mem::size_of::<T>())?;
     Some(std::ptr::read_unaligned(payload.as_ptr().cast()))
+}
+
+/// `n` bytes at `p`, if that memory is readable (`n == 0` needs no memory).
+unsafe fn slice_at<'a>(p: usize, n: usize) -> Option<&'a [u8]> {
+    if n == 0 {
+        return Some(&[]);
+    }
+    crate::gpu::shader::readable(p, n).then(|| unsafe { std::slice::from_raw_parts(p as *const u8, n) })
+}
+
+/// A NUL-terminated semantic name behind a pointer: hashed by its bytes, never by its address.
+unsafe fn hash_name(h: &mut Fnv64, p: usize) -> Option<()> {
+    if p == 0 {
+        h.u64(0);
+        return Some(());
+    }
+    let mut n = 0usize;
+    while n < 256 && crate::gpu::shader::readable(p + n, 1) && unsafe { *(p as *const u8).add(n) } != 0 {
+        n += 1;
+    }
+    if n >= 256 || !crate::gpu::shader::readable(p + n, 1) {
+        return None;
+    }
+    h.u64(n as u64);
+    h.bytes(unsafe { std::slice::from_raw_parts(p as *const u8, n) });
+    Some(())
+}
+
+/// STREAM_OUTPUT (type 7): the declaration entries and buffer strides behind their pointers are
+/// hashed by content (semantic-name addresses normalised); the counts and the rasterized stream
+/// as-is. Returns None when a pointed-to array is not readable.
+unsafe fn hash_stream_output(h: &mut Fnv64, p: &[u8]) -> Option<()> {
+    let d = read_state::<D3D12_STREAM_OUTPUT_DESC>(p)?;
+    h.u32(7);
+    h.u32(d.NumEntries);
+    h.u32(d.NumStrides);
+    h.u32(d.RasterizedStream);
+    if d.NumEntries > D3D12_SO_OUTPUT_COMPONENT_COUNT || d.NumStrides > D3D12_SO_STREAM_COUNT {
+        return None;
+    }
+    let esz = std::mem::size_of::<D3D12_SO_DECLARATION_ENTRY>();
+    let decl = slice_at(d.pSODeclaration as usize, d.NumEntries as usize * esz)?;
+    for i in 0..d.NumEntries as usize {
+        let e = read_state::<D3D12_SO_DECLARATION_ENTRY>(&decl[i * esz..])?;
+        h.u32(e.Stream);
+        hash_name(h, e.SemanticName.0 as usize)?;
+        h.u32(e.SemanticIndex);
+        h.bytes(&[e.StartComponent, e.ComponentCount, e.OutputSlot]);
+    }
+    let strides = slice_at(d.pBufferStrides as usize, d.NumStrides as usize * 4)?;
+    for w in strides.chunks_exact(4) {
+        h.u32(u32::from_le_bytes(w.try_into().ok()?));
+    }
+    Some(())
+}
+
+/// INPUT_LAYOUT (type 12): the element descriptions behind the pointer are hashed by content
+/// (semantic-name addresses normalised). Returns None when the array is not readable.
+unsafe fn hash_input_layout(h: &mut Fnv64, p: &[u8]) -> Option<()> {
+    let d = read_state::<D3D12_INPUT_LAYOUT_DESC>(p)?;
+    h.u32(12);
+    h.u32(d.NumElements);
+    if d.NumElements > 128 {
+        return None;
+    }
+    let esz = std::mem::size_of::<D3D12_INPUT_ELEMENT_DESC>();
+    let els = slice_at(d.pInputElementDescs as usize, d.NumElements as usize * esz)?;
+    for i in 0..d.NumElements as usize {
+        let e = read_state::<D3D12_INPUT_ELEMENT_DESC>(&els[i * esz..])?;
+        hash_name(h, e.SemanticName.0 as usize)?;
+        h.u32(e.SemanticIndex);
+        h.i32(e.Format.0);
+        h.u32(e.InputSlot);
+        h.u32(e.AlignedByteOffset);
+        h.i32(e.InputSlotClass.0);
+        h.u32(e.InstanceDataStepRate);
+    }
+    Some(())
+}
+
+/// VIEW_INSTANCING (type 22): the view instance locations behind the pointer are hashed raw (they
+/// hold no pointers); the count and flags as-is. Returns None when the array is not readable.
+unsafe fn hash_view_instancing(h: &mut Fnv64, p: &[u8]) -> Option<()> {
+    let d = read_state::<D3D12_VIEW_INSTANCING_DESC>(p)?;
+    h.u32(22);
+    h.u32(d.ViewInstanceCount);
+    h.i32(d.Flags.0);
+    if d.ViewInstanceCount > 1024 {
+        return None;
+    }
+    let locs = slice_at(d.pViewInstanceLocations as usize, d.ViewInstanceCount as usize * std::mem::size_of::<D3D12_VIEW_INSTANCE_LOCATION>())?;
+    h.bytes(locs);
+    Some(())
 }
 
 unsafe fn hash_blend(h: &mut Fnv64, p: &[u8]) -> Option<()> {
@@ -175,7 +268,10 @@ unsafe fn hash_depth_stencil(h: &mut Fnv64, ty: u32, p: &[u8]) -> Option<()> {
 
 /// Canonical cache key `(hash, total_shader_bytes)` for a two-pass mesh/PS pipeline stream,
 /// hashing referenced shader bytecodes and normalized fixed-function state (never pointers or
-/// struct padding). Shader pointers in the stream must refer to live shader bytecode. Returns `None` if an unsupported, duplicate, or unknown subobject is active.
+/// struct padding). Shader pointers in the stream must refer to live shader bytecode; the
+/// STREAM_OUTPUT, INPUT_LAYOUT and VIEW_INSTANCING arrays behind their pointers must be readable
+/// and are hashed by content with the semantic-name addresses normalised. Returns `None` if an
+/// unsupported, duplicate, unknown or unreadable subobject is active.
 pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gpu::recomp::pso::StaticSampler], driver_id: u64, mem_windows: u32) -> Option<(u64, usize)> {
     let mut subs = stream_subobjects(stream)?;
     let total = subs.iter().map(|(ty, payload)| {
@@ -200,26 +296,11 @@ pub(super) unsafe fn two_pass_stream_key(stream: &[u8], ps_samplers: &[crate::gp
     for (ty, payload) in subs {
         match ty {
             0 | 19 => {} // RS replaced by ABI RS via ps_samplers; CACHED_PSO is the lookup input
-            // These descriptors can carry inert pointers and padding in a title stream.
-            // Their counts and flags determine whether any state needs to be hashed.
-            7 => {
-                let state = read_state::<D3D12_STREAM_OUTPUT_DESC>(payload)?;
-                if state.NumEntries != 0 || state.NumStrides != 0 || state.RasterizedStream != 0 {
-                    return None;
-                }
-            }
-            12 => {
-                let state = read_state::<D3D12_INPUT_LAYOUT_DESC>(payload)?;
-                if state.NumElements != 0 {
-                    return None;
-                }
-            }
-            22 => {
-                let state = read_state::<D3D12_VIEW_INSTANCING_DESC>(payload)?;
-                if state.ViewInstanceCount != 0 || state.Flags.0 != 0 {
-                    return None;
-                }
-            }
+            // These descriptors carry live pointers and padding in a title stream, so hash
+            // their content field-wise and drop the address-bearing bytes.
+            7 => hash_stream_output(&mut h, payload)?,
+            12 => hash_input_layout(&mut h, payload)?,
+            22 => hash_view_instancing(&mut h, payload)?,
             1..=6 | 24 | 25 => {
                 let state = read_state::<D3D12_SHADER_BYTECODE>(payload)?;
                 if state.BytecodeLength == 0 && ty != 25 {
@@ -274,6 +355,8 @@ mod tests {
     use super::*;
     use super::super::StreamOut;
     use std::ffi::c_void;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    use windows::core::PCSTR;
 
     #[test]
     fn canonical_stream_key_distinguishes_state_samplers_and_driver() {
@@ -312,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_stream_key_normalizes_padding_and_rejects_pointer_subobjects() {
+    fn canonical_stream_key_normalizes_padding_and_rejects_unreadable_pointers() {
         let mut s1 = StreamOut::default();
         let mut rt1 = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: 1, ..Default::default() };
         rt1.RTFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28);
@@ -344,7 +427,7 @@ mod tests {
 
         unsafe {
             assert_eq!(two_pass_stream_key(&s1.0, &[], 1, 1), two_pass_stream_key(&s2.0, &[], 1, 1));
-            // Unknown subobject or active pointer subobject returns None safely.
+            // An unreadable pointer in a STREAM_OUTPUT/INPUT_LAYOUT/VIEW_INSTANCING subobject fails closed.
             let mut with_il = StreamOut::default();
             let il = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: 0x1234 as *const _, NumElements: 1 };
             with_il.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &il);
@@ -427,4 +510,234 @@ mod tests {
         assert_ne!(k0, two_pass_cs_key(&cs, &[], 2, 1));
         assert_ne!(k0, two_pass_cs_key(&[11u8; 64], &[], 1, 1));
     }
+
+    // One game-like MS pipeline stream: every subobject type that can carry an address, plus
+    // state. Two creations of the same logical pipeline differ only in the pointer fields.
+    #[derive(Clone)]
+    struct StreamParams {
+        rs: usize,
+        ms: Vec<u8>,
+        ps: Option<Vec<u8>>,
+        name: *const u8,
+        so_stream: u32,
+        stride: u32,
+        il_format: i32,
+        vi_count: u32,
+        vi_rtai: u32,
+        sample_mask: u32,
+        ds_format: i32,
+        rt_count: u32,
+        rt0: i32,
+        blend_src: i32,
+        cull: i32,
+        depth_func: i32,
+        topology: i32,
+        blob: Vec<u8>,
+    }
+
+    impl Default for StreamParams {
+        fn default() -> Self {
+            Self {
+                rs: 0x1000,
+                ms: vec![1, 2, 3, 4, 5],
+                ps: Some(vec![9, 8, 7]),
+                name: b"POSITION\0".as_ptr(),
+                so_stream: 0,
+                stride: 16,
+                il_format: 28,
+                vi_count: 2,
+                vi_rtai: 0,
+                sample_mask: u32::MAX,
+                ds_format: 45,
+                rt_count: 2,
+                rt0: 28,
+                blend_src: D3D12_BLEND_SRC_ALPHA.0,
+                cull: D3D12_CULL_MODE_BACK.0,
+                depth_func: D3D12_COMPARISON_FUNC_LESS.0,
+                topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0,
+                blob: vec![0xAA; 8],
+            }
+        }
+    }
+
+    // The stream plus the arrays its pointers refer to, kept alive for the key computation.
+    struct Built {
+        stream: StreamOut,
+        // heap buffers: their addresses stay valid while Built is moved around
+        _so_decl: Vec<D3D12_SO_DECLARATION_ENTRY>,
+        _strides: Vec<u32>,
+        _il: Vec<D3D12_INPUT_ELEMENT_DESC>,
+        _vi: Vec<D3D12_VIEW_INSTANCE_LOCATION>,
+    }
+
+    // Serialize `v` into the stream with its struct padding explicitly zeroed, so two
+    // constructions of the same value produce the same bytes.
+    fn put_zeroed<T>(s: &mut StreamOut, ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, v: &T, pads: &[std::ops::Range<usize>]) {
+        let mut b = unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }.to_vec();
+        for p in pads {
+            b[p.clone()].fill(0);
+        }
+        s.raw(ty.0 as u32, &b, std::mem::align_of::<T>() == 8);
+    }
+
+    fn game_like_stream(p: &StreamParams) -> Built {
+        let mut s = StreamOut::default();
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &(p.rs as *mut c_void));
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &p.ms);
+        if let Some(ps) = &p.ps {
+            s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+        }
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &p.topology);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &p.sample_mask);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &p.ds_format);
+        let mut rt: D3D12_RT_FORMAT_ARRAY = unsafe { std::mem::zeroed() };
+        rt.NumRenderTargets = p.rt_count;
+        rt.RTFormats[0] = DXGI_FORMAT(p.rt0);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+        let mut blend: D3D12_BLEND_DESC = unsafe { std::mem::zeroed() };
+        blend.RenderTarget[0].SrcBlend = D3D12_BLEND(p.blend_src);
+        let blend_pads: Vec<std::ops::Range<usize>> = (0..8).map(|i| 8 + 40 * i + 37..8 + 40 * i + 40).collect();
+        put_zeroed(&mut s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &blend, &blend_pads);
+        let mut rast: D3D12_RASTERIZER_DESC = unsafe { std::mem::zeroed() };
+        rast.CullMode = D3D12_CULL_MODE(p.cull);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &rast);
+        let mut ds: D3D12_DEPTH_STENCIL_DESC = unsafe { std::mem::zeroed() };
+        ds.DepthFunc = D3D12_COMPARISON_FUNC(p.depth_func);
+        put_zeroed(&mut s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &ds, &[18..20]);
+        let so_decl = vec![D3D12_SO_DECLARATION_ENTRY {
+            Stream: p.so_stream,
+            SemanticName: PCSTR(p.name),
+            SemanticIndex: 0,
+            StartComponent: 0,
+            ComponentCount: 3,
+            OutputSlot: 0,
+        }];
+        let strides = vec![p.stride, 0, 0, 0];
+        let mut so: D3D12_STREAM_OUTPUT_DESC = unsafe { std::mem::zeroed() };
+        so.pSODeclaration = so_decl.as_ptr();
+        so.NumEntries = so_decl.len() as u32;
+        so.pBufferStrides = strides.as_ptr();
+        so.NumStrides = strides.len() as u32;
+        put_zeroed(&mut s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT, &so, &[12..16, 28..32]);
+        let il = vec![D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(p.name),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT(p.il_format),
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }];
+        let mut ill: D3D12_INPUT_LAYOUT_DESC = unsafe { std::mem::zeroed() };
+        ill.pInputElementDescs = il.as_ptr();
+        ill.NumElements = il.len() as u32;
+        put_zeroed(&mut s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &ill, &[12..16]);
+        let vi = vec![D3D12_VIEW_INSTANCE_LOCATION { ViewportArrayIndex: 0, RenderTargetArrayIndex: p.vi_rtai }; 2];
+        let mut vid: D3D12_VIEW_INSTANCING_DESC = unsafe { std::mem::zeroed() };
+        vid.ViewInstanceCount = p.vi_count;
+        vid.pViewInstanceLocations = vi.as_ptr();
+        put_zeroed(&mut s, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, &vid, &[4..8, 20..24]);
+        s.put(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO,
+            &D3D12_CACHED_PIPELINE_STATE { pCachedBlob: p.blob.as_ptr() as _, CachedBlobSizeInBytes: p.blob.len() },
+        );
+        Built { stream: s, _so_decl: so_decl, _strides: strides, _il: il, _vi: vi }
+    }
+
+    // The absolute byte ranges of a stream that hold an address: the only bytes that may differ
+    // between two creations of the same logical pipeline.
+    fn pointer_field_ranges(buf: &[u8]) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= buf.len() {
+            let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let Some((psize, palign)) = crate::hle::d3d12x::null::subobject_payload(ty) else { break };
+            let poff = if palign == 8 { 8 } else { 4 };
+            let p = off + poff;
+            match ty {
+                0 | 1..=6 | 12 | 19 | 24 | 25 => out.push(p..p + 8),
+                7 => {
+                    out.push(p..p + 8);
+                    out.push(p + 16..p + 24);
+                }
+                22 => out.push(p + 8..p + 16),
+                _ => {}
+            }
+            off += (poff + psize + 7) & !7;
+        }
+        out
+    }
+
+    #[test]
+    fn same_logical_pipeline_two_creations_share_the_key() {
+        let name_b = b"POSITION\0".to_vec();
+        let mut a = StreamParams::default();
+        let mut b = StreamParams { name: name_b.as_ptr(), ..StreamParams::default() };
+        b.rs = 0x2000;
+        b.ms = vec![1, 2, 3, 4, 5]; // same content, different allocation
+        b.ps = Some(vec![9, 8, 7]);
+        b.blob = vec![0xAA; 8];
+        let sa = game_like_stream(&a);
+        let sb = game_like_stream(&b);
+        assert_ne!(sa.stream.0, sb.stream.0);
+        let ranges = pointer_field_ranges(&sa.stream.0);
+        let diffs: Vec<usize> = (0..sa.stream.0.len()).filter(|&i| sa.stream.0[i] != sb.stream.0[i]).collect();
+        assert!(!diffs.is_empty());
+        for d in &diffs {
+            assert!(ranges.iter().any(|r| r.contains(d)), "byte {d:#x} varies outside the pointer fields");
+        }
+        let mut za = sa.stream.0.clone();
+        let mut zb = sb.stream.0.clone();
+        for r in &ranges {
+            za[r.clone()].fill(0);
+            zb[r.clone()].fill(0);
+        }
+        assert_eq!(za, zb);
+        unsafe {
+            assert_eq!(
+                two_pass_stream_key(&sa.stream.0, &[], 0x1234, 1),
+                two_pass_stream_key(&sb.stream.0, &[], 0x1234, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn stream_key_changes_with_each_distinguishing_field() {
+        let base = StreamParams::default();
+        let k = |p: &StreamParams| {
+            let b = game_like_stream(p);
+            unsafe { two_pass_stream_key(&b.stream.0, &[], 0x1234, 1).unwrap() }
+        };
+        let k0 = k(&base);
+        fn flip(base: &StreamParams, k: impl Fn(&StreamParams) -> (u64, usize), k0: (u64, usize), what: &str, f: impl Fn(&mut StreamParams)) {
+            let mut p = base.clone();
+            f(&mut p);
+            assert_ne!(k0, k(&p), "the key must change when {what} changes");
+        }
+        flip(&base, k, k0, "MS bytecode", |p| p.ms = vec![1, 2, 3, 4, 6]);
+        flip(&base, k, k0, "PS bytecode", |p| p.ps = Some(vec![9, 8, 8]));
+        flip(&base, k, k0, "PS presence", |p| p.ps = None);
+        flip(&base, k, k0, "semantic name behind the SO/IL pointers", |p| p.name = b"TEXCOORD\0".as_ptr());
+        flip(&base, k, k0, "stream-output entry", |p| p.so_stream = 1);
+        flip(&base, k, k0, "stream-output buffer stride", |p| p.stride = 32);
+        flip(&base, k, k0, "input element format", |p| p.il_format = 45);
+        flip(&base, k, k0, "view instance count", |p| p.vi_count = 1);
+        flip(&base, k, k0, "view instance location content", |p| p.vi_rtai = 1);
+        flip(&base, k, k0, "sample mask", |p| p.sample_mask = 0x0FFF_FFFF);
+        flip(&base, k, k0, "depth-stencil format", |p| p.ds_format = 50);
+        flip(&base, k, k0, "render-target count", |p| p.rt_count = 1);
+        flip(&base, k, k0, "render-target format", |p| p.rt0 = 45);
+        flip(&base, k, k0, "blend src", |p| p.blend_src = D3D12_BLEND_ONE.0);
+        flip(&base, k, k0, "cull mode", |p| p.cull = D3D12_CULL_MODE_NONE.0);
+        flip(&base, k, k0, "depth func", |p| p.depth_func = D3D12_COMPARISON_FUNC_ALWAYS.0);
+        flip(&base, k, k0, "topology", |p| p.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE.0);
+        // samplers, driver id and memory-window count stay in the key
+        let s = game_like_stream(&base);
+        unsafe {
+            assert_ne!(k0, two_pass_stream_key(&s.stream.0, &[([1, 2, 3, 4], false)], 0x1234, 1).unwrap());
+            assert_ne!(k0, two_pass_stream_key(&s.stream.0, &[], 0x5678, 1).unwrap());
+            assert_ne!(k0, two_pass_stream_key(&s.stream.0, &[], 0x1234, 4 | crate::gpu::recomp::HEAP_WINDOWS).unwrap());
+        }
+    }
 }
+
