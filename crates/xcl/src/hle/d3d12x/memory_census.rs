@@ -13,6 +13,7 @@ use std::sync::{LazyLock, Mutex, Once};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_DIMENSION_BUFFER,
+    D3D12_RESOURCE_DIMENSION_TEXTURE2D,
 };
 
 /// Bytes by DXGI format (the format value as u32).
@@ -130,10 +131,11 @@ fn compute_block_compressed_size(width: u64, height: u64, depth: u64, bytes_per_
         let blocks_d = (d + 3) / 4;
         total += blocks_w * blocks_h * blocks_d * bytes_per_block;
 
-        // Next mip level
-        w = w.max(1) / 2;
-        h = h.max(1) / 2;
-        d = d.max(1) / 2;
+        // Next mip level. Every extent halves but never reaches zero: a 2D texture has depth 1,
+        // and a plain `d / 2` would make it 0 and end the loop after the first level.
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        d = (d / 2).max(1);
     }
     total
 }
@@ -626,7 +628,7 @@ mod tests {
         // For this test, we need to use a format that maps to 4 bpp
         // DXGI_FORMAT_R8G8B8A8_UNORM = 28
         let size = compute_uncompressed_size(
-            DXGI_FORMAT::D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32,
             28, // R8G8B8A8_UNORM
             1024, 1024, 1, 1
         );
@@ -637,7 +639,7 @@ mod tests {
     fn buffer_size() {
         // Buffer: size is the width field
         let size = compute_resource_size(
-            DXGI_FORMAT::D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32,
+            D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32,
             0, // format doesn't matter for buffers
             1024 * 1024, // 1MB buffer
             0, 0, 1
@@ -745,7 +747,7 @@ mod tests {
         // 4x4: 1x1 = 1 block * 16 = 16
         // 2x2: 1x1 = 1 block * 16 = 16 (ceil(2/4)=1)
         // 1x1: 1x1 = 1 block * 16 = 16 (ceil(1/4)=1)
-        // Total: 65536 + 16384 + 4096 + 1024 + 256 + 64 + 16 + 16 + 16 = 87392
-        assert_eq!(size, 87392, "BC7 256x256 with 9 mips should be 87392 bytes");
+        // Total: 65536 + 16384 + 4096 + 1024 + 256 + 64 + 16 + 16 + 16 = 87408
+        assert_eq!(size, 87408, "BC7 256x256 with 9 mips should be 87408 bytes");
     }
 }
