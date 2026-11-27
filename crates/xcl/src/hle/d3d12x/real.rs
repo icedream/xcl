@@ -4497,7 +4497,7 @@ fn driver_compile(kind: &str, bytes: usize, gate: bool, build: impl FnOnce() -> 
 }
 
 /// `XCL_SKIP_BIG_DXIL=<bytes>`: do not hand the driver a compute program above that much DXIL.
-fn skip_big_dxil() -> Option<usize> {
+pub(crate) fn skip_big_dxil() -> Option<usize> {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("XCL_SKIP_BIG_DXIL").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0))
 }

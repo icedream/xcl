@@ -1614,6 +1614,10 @@ impl Pipelines {
             }
             *n += 1;
         }
+        if dxil.len() >= 150_000 {
+            // name the program that may fault the driver compiler: the crash log ends here
+            eprintln!("  make: {} B chained {} {}", dxil.len(), chained, path.as_ref().map_or_else(String::new, |p| p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())));
+        }
         let from_cache = cached.as_ref().and_then(|bytes| {
             desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: bytes.as_ptr().cast(), CachedBlobSizeInBytes: bytes.len() };
             // a driver that cannot use the blob may compile from the DXIL itself and still
