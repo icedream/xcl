@@ -89,8 +89,9 @@ impl Scratch {
 impl Shader {
     /// Start with full native wave32 groups. A fresh dispatch can assign a
     /// different physical wave to a group; wave-lane index identifies the
-    /// continuation within a full, single-wave group.
-    pub(crate) fn split_compute(&self, threads: [u32; 3], split_tid: Option<Value>, limit: usize) -> Option<DispatchChain> {
+    /// continuation within a full, single-wave group. The pieces run in the
+    /// same wave size as the whole program (`piece_hw`).
+    pub(crate) fn split_compute(&self, threads: [u32; 3], split_tid: Option<Value>, limit: usize, piece_hw: u32) -> Option<DispatchChain> {
         if self.m.globals.iter().any(|g| !g.constant && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs"))) {
             return None;
         }
@@ -149,11 +150,11 @@ impl Shader {
             (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
         }
         stride.checked_mul(threads[0])?.checked_mul(4)?;
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix)).collect::<Option<Vec<_>>>()?;
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix, piece_hw)).collect::<Option<Vec<_>>>()?;
         Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
     }
 
-    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32]) -> Option<Vec<u8>> {
+    fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32], piece_hw: u32) -> Option<Vec<u8>> {
         let src = &self.m;
         let mut dst = self.dispatch_piece();
         let mut values = HashMap::new();
@@ -271,7 +272,7 @@ impl Shader {
         // a refused piece leaves the whole program unsplit: say so
         let refused = |e: String| crate::xlog_warn!("compute split: piece {} of {} refused, the program stays whole: {}",
             stage + 1, plan.blocks.len(), e.lines().next().unwrap_or_default());
-        let blob = dst.try_finish(threads, Some(32)).map_err(|e| refused(e.to_string())).ok()?;
+        let blob = dst.try_finish(threads, Some(piece_hw)).map_err(|e| refused(e.to_string())).ok()?;
         crate::gpu::dxil::validate::validate(&blob).map_err(refused).ok()?;
         Some(blob)
     }
@@ -280,6 +281,12 @@ impl Shader {
         for f in [Feature::Doubles, Feature::Int64Ops, Feature::DoubleExtensions,
                   Feature::ResourceHeapIndexing, Feature::SamplerHeapIndexing] {
             self.features.remove(&f);
+        }
+        // wave ops: the whole program's flag stays only on the pieces that have one,
+        // the validator wants flags to match usage
+        if !self.m.blocks.iter().flatten().any(|&i| matches!(&self.m.insts[i as usize].op,
+            Op::Call(f, _) if self.m.funcs[*f as usize].name.starts_with("dx.op.wave"))) {
+            self.features.remove(&Feature::WaveOps);
         }
         // typed UAV loads (`texture_load` without a mip): the whole program's flag stays only on
         // the pieces that have one, the validator wants flags to match usage
@@ -839,7 +846,7 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(40).expect("partition around oversized loop");
             assert!(plan.blocks.iter().any(|piece| piece == &[oversized]));
         }
-        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40);
+        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40, 32);
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
         let chain = chain.expect("split the synthetic program");
@@ -921,7 +928,7 @@ mod tests {
             assert_eq!(slot(incoming, saved), slot(outgoing, replacement));
         }
 
-        let chain = lw.s.split_compute(geometry, None, limit).unwrap();
+        let chain = lw.s.split_compute(geometry, None, limit, 32).unwrap();
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         let initial: Vec<u32> = (0..32).map(|i| 1009 * i + 77).collect();
         let mut expected: Vec<_> = initial.iter().map(|&v| {
@@ -971,7 +978,7 @@ mod tests {
         lw.s.m.ret();
         lw.s.m.optimize();
         let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
-        let chain = lw.s.split_compute(geometry, None, limit).expect("every piece validates");
+        let chain = lw.s.split_compute(geometry, None, limit, 32).expect("every piece validates");
         assert!(chain.pieces.len() >= 2);
     }
 
@@ -1088,7 +1095,7 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(64).expect("partition branch fixture");
             let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
             assert!(plan.edges.iter().any(|edge| stage(edge.to) > stage(edge.from) + 1), "exercise a forward skip over an intermediate piece");
-            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64).expect("split branch fixture");
+            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64, 32).expect("split branch fixture");
             assert!(chain.pieces.len() >= 3);
             let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
             crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");

@@ -4840,9 +4840,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     // `XCL_SKIP_BIG_DXIL=<bytes>`: refuse to hand the driver a program above that size. Its own
     // compiler crashes on this title's ~1 MB compute programs (amdxc64, fault at 0xa8, with
     // D3DSCache.dll in the stack), which takes the whole process down; a stand-in costs the pass
-    // and keeps the title running.
+    // and keeps the title running. A dispatch chain does not hand the whole program over (the
+    // driver sees its pieces), so it is not refused.
     if let Some(limit) = skip_big_dxil() {
-        if dxil.len() > limit {
+        if dxil.len() > limit && compiled.dispatch_chain.is_none() {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 8 {
                 crate::xlog_warn!("D3D12.X: compute PSO of {} bytes of DXIL not handed to the driver (XCL_SKIP_BIG_DXIL={limit}) – stand-in", dxil.len());
@@ -6848,11 +6849,16 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let bytes = mesh_bytes + tp.cs.len();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let mut slot = None;
-    let mut take_cold_slot = || {
-        if gate && slot.is_none() {
-            let waited = std::time::Instant::now();
-            slot = Some(big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
-            crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
+    // `take`: a cold compile's turn; `false` releases it early (the split pieces are small)
+    let mut cold_slot = |take: bool| {
+        if take {
+            if gate && slot.is_none() {
+                let waited = std::time::Instant::now();
+                slot = Some(big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted));
+                crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated, waited {} ms", waited.elapsed().as_millis());
+            }
+        } else {
+            drop(slot.take());
         }
     };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
@@ -6885,7 +6891,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         (hr, pso, took)
     };
     if gcached.is_none() {
-        take_cold_slot();
+        cold_slot(true);
     }
     let (mut hr, mut mesh_pso, mut gin_driver) = match mflight {
         Some(cached) => (S_OK, (!cached.is_null()).then(|| unsafe { ID3D12PipelineState::from_raw(cached) }), std::time::Duration::ZERO),
@@ -6900,7 +6906,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
             });
             driver_cache::note(false, rejected_path);
         }
-        take_cold_slot();
+        cold_slot(true);
         (hr, mesh_pso, gin_driver) = create_mesh("mesh pass retry", None);
         greused = false;
     }
@@ -6935,59 +6941,79 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
-    // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
-    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
-    let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let mut ccached = compute_blob(ckey);
-    let cdisk = driver_cache::path(&tp.cs, 0);
-    let cfrom_disk = ccached.is_none();
-    if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
-    if let Some(b) = &ccached {
-        cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    } else {
-        take_cold_slot();
-    }
-    let iid = pc_iid(Kind::PipelineState);
+    // a split compute pass goes through the chain machinery a standalone compute PSO uses: the
+    // driver compiles the pieces, never the monolith (the whole stays its fallback)
     let mut compute: *mut c_void = std::ptr::null_mut();
-    // the compute pass's object-cache key (the same identity a standalone compute compile of
-    // `tp.cs` uses); a cache hit never waits, so it cannot deadlock the gate the way an
-    // in-flight join could – hence still no in-flight key here, as before
-    let cobj = compute_compile_key(&tp.cs, rs_content_id(&tp.samplers, false), 0, false);
-    let compute_kept = pso_cache_get(&cobj, &mut compute as *mut *mut c_void);
-    // no in-flight key here: this caller may hold the turn above, and joining a compile whose
-    // first requester waits for a slot would deadlock the gate
-    let (mut hc, mut cin_driver) = if compute_kept {
-        (S_OK, std::time::Duration::ZERO)
-    } else {
-        driver_compile_identified("compute pass", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
-            driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
-        })
-    };
-    if hc < 0 && ccached.is_some() {
-        forget_compute_blob(ckey);
-        if cfrom_disk {
-            driver_cache::note(false, cdisk.as_deref());
+    let mut compute_rs = rs as usize;
+    let mut hc: HRESULT = S_OK;
+    let mut chained = 0usize;
+    if let Some(plan) = tp.dispatch_chain.as_ref().filter(|c| c.pieces.len() >= 2).cloned() {
+        cold_slot(false); // the pieces are small compiles: no big-compile turn held over them
+        let record = crate::gpu::shader::fnv64(&tp.cs);
+        let iid = pc_iid(Kind::PipelineState);
+        let pieces = plan.pieces.len();
+        if let Some(chain_rs) = dispatch_chain::build(this, fc, &cdesc, &iid, &mut compute as *mut *mut c_void, record, &tp.cs, &tp.samplers, plan) {
+            if !compute.is_null() {
+                compute_rs = chain_rs;
+                chained = pieces;
+            }
         }
-        take_cold_slot();
-        cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        compute = std::ptr::null_mut();
-        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
-            driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
-        });
-        hc = retried;
-        cin_driver += took;
     }
-    let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
+    if chained == 0 {
+        // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
+        // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+        let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
+        let mut ccached = compute_blob(ckey);
+        let cdisk = driver_cache::path(&tp.cs, 0);
+        let cfrom_disk = ccached.is_none();
+        if cfrom_disk {
+            ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
         }
-        pso_cache_put(&cobj, compute, tp.cs.len());
-    } else if creused && cfrom_disk {
-        driver_cache::note(true, None);
+        if let Some(b) = &ccached {
+            cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+        } else {
+            cold_slot(true);
+        }
+        let iid = pc_iid(Kind::PipelineState);
+        // the compute pass's object-cache key (the same identity a standalone compute compile of
+        // `tp.cs` uses); a cache hit never waits, so it cannot deadlock the gate the way an
+        // in-flight join could - hence still no in-flight key here, as before
+        let cobj = compute_compile_key(&tp.cs, rs_content_id(&tp.samplers, false), 0, false);
+        let compute_kept = pso_cache_get(&cobj, &mut compute as *mut *mut c_void);
+        // no in-flight key here: this caller may hold the turn above, and joining a compile whose
+        // first requester waits for a slot would deadlock the gate
+        let (h, mut cin_driver) = if compute_kept {
+            (S_OK, std::time::Duration::ZERO)
+        } else {
+            driver_compile_identified("compute pass", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
+                driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+            })
+        };
+        hc = h;
+        if hc < 0 && ccached.is_some() {
+            forget_compute_blob(ckey);
+            if cfrom_disk {
+                driver_cache::note(false, cdisk.as_deref());
+            }
+            cold_slot(true);
+            cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            compute = std::ptr::null_mut();
+            let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, None, std::ptr::null_mut(), || {
+                driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
+            });
+            hc = retried;
+            cin_driver += took;
+        }
+        let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
+        if hc >= 0 && !creused && !compute.is_null() {
+            keep_compute_blob(ckey, compute, tp.cs.len());
+            if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
+                driver_cache::keep(p, &b, cin_driver);
+            }
+            pso_cache_put(&cobj, compute, tp.cs.len());
+        } else if creused && cfrom_disk {
+            driver_cache::note(true, None);
+        }
     }
     drop(slot);
     if hc < 0 || compute.is_null() {
@@ -6997,10 +7023,10 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mesh_pso = mesh_pso.into_raw();
     *ppv = mesh_pso;
     note_pso_rs(mesh_pso, mesh_rs);
-    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs: rs as usize, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
+    TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL{})", tp.cs.len(), tp.ms.len(), if chained != 0 { format!(", {} split pieces", chained) } else { String::new() });
     }
     hr
 }
@@ -9451,6 +9477,7 @@ mod mesh_stream_tests {
             record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
+            dispatch_chain: None,
         };
         let stream = StreamOut::default();
         let iid = pc_iid(Kind::PipelineState);

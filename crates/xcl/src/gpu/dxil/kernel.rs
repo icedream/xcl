@@ -74,6 +74,12 @@ pub fn dispatch_piece_limit() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_INSTRUCTIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(12_500)
 }
 
+/// `XCL_DIRECT_SPLIT_LARGE`: DXIL bytes above which a program that would otherwise stay
+/// whole (native wave64, the mesh pass) is split into a dispatch chain too.
+pub fn dispatch_split_large() -> usize {
+    std::env::var("XCL_DIRECT_SPLIT_LARGE").ok().and_then(|s| s.parse().ok()).unwrap_or(256 << 10)
+}
+
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
@@ -206,6 +212,7 @@ fn translate_on_this_thread(
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
+    let compute_like = matches!(entry, Entry::Compute(_) | Entry::Mesh(_) | Entry::Geometry(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
@@ -226,16 +233,21 @@ fn translate_on_this_thread(
         Entry::Compute(cs) => {
             let (tid, gtid) = lw.setup_lanes_compute(cs.threads, uses_lds);
             if split && !uses_lds && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
+            // a native wave64 group is one wave: its thread id identifies the split's
+            // continuation slots (the split itself is size-driven, `finish_dispatch`)
+            if !split && o.wave64 && cs.threads == [64, 1, 1] { split_tid = Some(tid); }
             compute_init(&mut lw, cs, tid, gtid);
             cs.threads
         }
         Entry::Mesh(ms) => {
             let (tid, _) = lw.setup_lanes_compute([ms.threads, 1, 1], uses_lds);
             mesh_init(&mut lw, ms, tid, io);
+            split_tid = Some(tid);
             [ms.threads, 1, 1]
         }
         Entry::Geometry(g) => {
             let (tid, _) = lw.setup_lanes_compute([64, 1, 1], uses_lds);
+            split_tid = Some(tid);
             let used: BTreeSet<u64> = cfg.insts.iter().flat_map(|d| {
                 let (r, w) = crate::gpu::rdna2::vgpr_uses(d);
                 r.into_iter().chain(w)
@@ -443,7 +455,7 @@ fn translate_on_this_thread(
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
+    let limit = if compute_like && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
     lw.finish_dispatch(numthreads, hw, limit, split_tid)
 }
 
@@ -628,8 +640,21 @@ impl Lw {
             self.s.try_finish_graphics(g.io, info)
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
-            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit).map(std::sync::Arc::new);
+            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit, hw).map(std::sync::Arc::new);
             self.s.finish_optimized(numthreads, Some(hw))
+        } else if limit > 0 && split_tid.is_some() {
+            // native wave64: split only when the whole program is large,
+            // `XCL_DIRECT_SPLIT_LARGE` – under it nothing changes
+            self.s.m.optimize();
+            let chain = self.s.split_compute(numthreads, split_tid, limit, hw).map(std::sync::Arc::new);
+            let c = self.s.finish_optimized(numthreads, Some(hw));
+            let large = c.as_ref().is_ok_and(|c| c.len() > dispatch_split_large());
+            match (chain, large) {
+                (Some(chain), true) => dispatch_chain = Some(chain),
+                (None, true) => crate::xlog_info!("compute split: a {} B program stays whole: no valid split", c.as_ref().map_or(0, |c| c.len())),
+                _ => {}
+            }
+            c
         } else {
             self.s.try_finish(numthreads, Some(hw))
         }
@@ -686,6 +711,82 @@ fn dispatch_chain_native_wave64_builds_whole() {
     let expected: Vec<_> = initial.iter().map(|v| v + 40 * 64).collect();
     let result = runner::dispatch(&program.dxil, [1, 1, 1], &[], &initial).unwrap();
     assert_eq!(result, expected);
+}
+
+/// The `dispatch_chain_native_wave64_builds_whole` program, `updates` conditional update pairs
+/// long, with the entry's thread id as the split continuation prefix.
+#[cfg(test)]
+fn split_fixture(entry: Entry, options: KernelOptions, threads: [u32; 3], updates: usize) -> (Lw, Value) {
+    let mut lw = Lw::new(&[], &Default::default(), options, &entry);
+    let (tid, _) = lw.setup_lanes_compute(threads, false);
+    let offset = lw.shlc(tid, 2);
+    let width = lw.s.wave_lane_count();
+    let mem = lw.mems[0];
+    for _ in 0..updates {
+        let update = lw.s.m.new_block();
+        let join = lw.s.m.new_block();
+        let taken = lw.cmp(Pred::ULt, tid, width);
+        lw.s.m.cond_br(taken, update, join);
+        lw.s.m.set_block(update);
+        let old = lw.s.raw_load(mem, offset, 1)[0];
+        let new = lw.add(old, width);
+        lw.s.raw_store(mem, offset, &[new]);
+        lw.s.m.br(join);
+        lw.s.m.set_block(join);
+    }
+    lw.s.m.ret();
+    (lw, tid)
+}
+
+/// A native wave64 compute program over `XCL_DIRECT_SPLIT_LARGE` splits; 8ddb9dc6 built it whole.
+#[cfg(test)]
+#[test]
+fn dispatch_chain_splits_large_native_wave64() {
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let (mut lw, tid) = split_fixture(Entry::Compute(cs), options, threads, 4500);
+    let program = lw.finish_dispatch(threads, 64, dispatch_piece_limit(), Some(tid)).unwrap();
+    assert!(program.dxil.len() > dispatch_split_large(), "the fixture must exceed the threshold: {} B", program.dxil.len());
+    let chain = program.dispatch_chain.expect("a program over the threshold splits");
+    assert!(chain.pieces.len() >= 2);
+    assert!(chain.pieces.iter().all(|p| p.len() < program.dxil.len()), "every piece is smaller than the whole");
+    for piece in &chain.pieces {
+        super::validate::validate(piece).expect("valid split piece");
+    }
+    super::validate::validate(&program.dxil).expect("valid whole shader");
+}
+
+/// The same program under the threshold stays whole, as at 8ddb9dc6.
+#[cfg(test)]
+#[test]
+fn dispatch_chain_keeps_small_native_wave64_whole() {
+    let threads = [64, 1, 1];
+    let cs = CsInterface { threads, ..Default::default() };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let (mut lw, tid) = split_fixture(Entry::Compute(cs), options, threads, 8);
+    let program = lw.finish_dispatch(threads, 64, dispatch_piece_limit(), Some(tid)).unwrap();
+    assert!(program.dxil.len() <= dispatch_split_large(), "the fixture must stay under the threshold: {} B", program.dxil.len());
+    assert!(program.dispatch_chain.is_none(), "a program under the threshold stays whole");
+    super::validate::validate(&program.dxil).expect("valid whole shader");
+}
+
+/// The mesh pass (a two-pass compute entry, several waves per group) splits over the threshold.
+#[cfg(test)]
+#[test]
+fn dispatch_chain_splits_large_mesh_pass() {
+    let threads = [128, 1, 1];
+    let ms = crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 128, max_vertices: 64, max_primitives: 64 };
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let (mut lw, tid) = split_fixture(Entry::Mesh(ms), options, threads, 4500);
+    let program = lw.finish_dispatch(threads, 64, dispatch_piece_limit(), Some(tid)).unwrap();
+    assert!(program.dxil.len() > dispatch_split_large(), "the fixture must exceed the threshold: {} B", program.dxil.len());
+    let chain = program.dispatch_chain.expect("the mesh pass splits");
+    assert!(chain.pieces.len() >= 2);
+    for piece in &chain.pieces {
+        super::validate::validate(piece).expect("valid mesh split piece");
+    }
+    super::validate::validate(&program.dxil).expect("valid mesh whole shader");
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
