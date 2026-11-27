@@ -81,6 +81,11 @@ unsafe fn hash_name(h: &mut Fnv64, p: usize) -> Option<()> {
 /// as-is. Returns None when a pointed-to array is not readable.
 unsafe fn hash_stream_output(h: &mut Fnv64, p: &[u8]) -> Option<()> {
     let d = read_state::<D3D12_STREAM_OUTPUT_DESC>(p)?;
+    // an empty descriptor carries only inert pointers: hash nothing, so a stream with one
+    // matches the same stream without it
+    if d.NumEntries == 0 && d.NumStrides == 0 && d.RasterizedStream == 0 {
+        return Some(());
+    }
     h.u32(7);
     h.u32(d.NumEntries);
     h.u32(d.NumStrides);
@@ -108,6 +113,9 @@ unsafe fn hash_stream_output(h: &mut Fnv64, p: &[u8]) -> Option<()> {
 /// (semantic-name addresses normalised). Returns None when the array is not readable.
 unsafe fn hash_input_layout(h: &mut Fnv64, p: &[u8]) -> Option<()> {
     let d = read_state::<D3D12_INPUT_LAYOUT_DESC>(p)?;
+    if d.NumElements == 0 {
+        return Some(());
+    }
     h.u32(12);
     h.u32(d.NumElements);
     if d.NumElements > 128 {
@@ -132,6 +140,9 @@ unsafe fn hash_input_layout(h: &mut Fnv64, p: &[u8]) -> Option<()> {
 /// hold no pointers); the count and flags as-is. Returns None when the array is not readable.
 unsafe fn hash_view_instancing(h: &mut Fnv64, p: &[u8]) -> Option<()> {
     let d = read_state::<D3D12_VIEW_INSTANCING_DESC>(p)?;
+    if d.ViewInstanceCount == 0 && d.Flags.0 == 0 {
+        return Some(());
+    }
     h.u32(22);
     h.u32(d.ViewInstanceCount);
     h.i32(d.Flags.0);
