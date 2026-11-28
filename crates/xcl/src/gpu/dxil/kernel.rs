@@ -80,6 +80,13 @@ pub fn dispatch_split_large() -> usize {
     std::env::var("XCL_DIRECT_SPLIT_LARGE").ok().and_then(|s| s.parse().ok()).unwrap_or(256 << 10)
 }
 
+/// `XCL_SPLIT_PIECE_MAX_KB`: DXIL bytes a split piece should stay under (default 192). The
+/// instruction limit alone lets pieces reach the hundreds of KB, where the AMD driver compiler
+/// faults; an over-target piece is re-planned with a smaller instruction limit.
+pub fn dispatch_piece_max_bytes() -> usize {
+    std::env::var("XCL_SPLIT_PIECE_MAX_KB").ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(192) << 10
+}
+
 /// `XCL_DIRECT_COMPACT`: `1` forces the compact form, `0` forbids it, unset uses automatic selection.
 pub fn compact_mode() -> Option<bool> {
     match std::env::var("XCL_DIRECT_COMPACT").as_deref() {
@@ -640,13 +647,13 @@ impl Lw {
             self.s.try_finish_graphics(g.io, info)
         } else if limit > 0 && (numthreads == [32, 1, 1] || split_tid.is_some()) && hw == 32 {
             self.s.m.optimize();
-            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit, hw).map(std::sync::Arc::new);
+            dispatch_chain = self.s.split_compute(numthreads, split_tid, limit, hw, dispatch_piece_max_bytes()).map(std::sync::Arc::new);
             self.s.finish_optimized(numthreads, Some(hw))
         } else if limit > 0 && split_tid.is_some() {
             // native wave64: split only when the whole program is large,
             // `XCL_DIRECT_SPLIT_LARGE` – under it nothing changes
             self.s.m.optimize();
-            let chain = self.s.split_compute(numthreads, split_tid, limit, hw).map(std::sync::Arc::new);
+            let chain = self.s.split_compute(numthreads, split_tid, limit, hw, dispatch_piece_max_bytes()).map(std::sync::Arc::new);
             let c = self.s.finish_optimized(numthreads, Some(hw));
             let large = c.as_ref().is_ok_and(|c| c.len() > dispatch_split_large());
             match (chain, large) {

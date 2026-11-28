@@ -90,8 +90,10 @@ impl Shader {
     /// Start with full native wave32 groups. A fresh dispatch can assign a
     /// different physical wave to a group; wave-lane index identifies the
     /// continuation within a full, single-wave group. The pieces run in the
-    /// same wave size as the whole program (`piece_hw`).
-    pub(crate) fn split_compute(&self, threads: [u32; 3], split_tid: Option<Value>, limit: usize, piece_hw: u32) -> Option<DispatchChain> {
+    /// same wave size as the whole program (`piece_hw`). A piece over `piece_max`
+    /// bytes is re-planned with a smaller instruction limit, a few halvings at
+    /// most; the largest valid plan stays when none fits the byte target.
+    pub(crate) fn split_compute(&self, threads: [u32; 3], split_tid: Option<Value>, limit: usize, piece_hw: u32, piece_max: usize) -> Option<DispatchChain> {
         if self.m.globals.iter().any(|g| !g.constant && !(split_tid.is_some() && matches!(g.name.as_str(), "xcl_xw" | "xcl_xs"))) {
             return None;
         }
@@ -133,6 +135,32 @@ impl Shader {
             }
             if exchange != 0 { return None; }
         }
+        let largest = |pieces: &[Vec<u8>]| pieces.iter().map(Vec::len).max().unwrap_or(0);
+        let mut made = self.pieces_at(limit, threads, &prefix, piece_hw)?;
+        if largest(&made.1) > piece_max {
+            let mut fitted = None;
+            let mut at = limit;
+            for _ in 0..3 {
+                at /= 2;
+                if at == 0 { break; }
+                let Some(next) = self.pieces_at(at, threads, &prefix, piece_hw) else { break; };
+                if largest(&next.1) <= piece_max {
+                    fitted = Some(next);
+                    break;
+                }
+            }
+            match fitted {
+                Some(next) => made = next,
+                None => crate::xlog_info!("compute split: a piece stays at {} B, over the {} B target (no smaller plan)", largest(&made.1), piece_max),
+            }
+        }
+        let (dwords_per_group, pieces) = made;
+        Some(DispatchChain { pieces, dwords_per_group })
+    }
+
+    /// The plan at `limit` finished into pieces: the scratch one group needs and the pieces'
+    /// DXIL. `split_compute`'s byte target picks among these.
+    fn pieces_at(&self, limit: usize, threads: [u32; 3], prefix: &[u32], piece_hw: u32) -> Option<(u32, Vec<Vec<u8>>)> {
         let plan = self.m.dispatch_plan(limit)?;
         // Slot zero is the tag. Every transported SSA value owns its payload slots
         // until the chain finishes. An outgoing store can never overwrite a value
@@ -150,8 +178,8 @@ impl Shader {
             (stride, slots) = self.m.reuse_piece_slots(&plan, &slots)?;
         }
         stride.checked_mul(threads[0])?.checked_mul(4)?;
-        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, &prefix, piece_hw)).collect::<Option<Vec<_>>>()?;
-        Some(DispatchChain { pieces, dwords_per_group: stride.checked_mul(threads[0])? })
+        let pieces = (0..plan.blocks.len()).map(|i| self.make_piece(&plan, i, stride, &slots, threads, prefix, piece_hw)).collect::<Option<Vec<_>>>()?;
+        Some((stride.checked_mul(threads[0])?, pieces))
     }
 
     fn make_piece(&self, plan: &Plan, stage: usize, stride: u32, slots: &BTreeMap<Value, u32>, threads: [u32; 3], prefix: &[u32], piece_hw: u32) -> Option<Vec<u8>> {
@@ -846,7 +874,7 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(40).expect("partition around oversized loop");
             assert!(plan.blocks.iter().any(|piece| piece == &[oversized]));
         }
-        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40, 32);
+        let chain = lw.s.split_compute(geometry, split.then_some(tid), 40, 32, usize::MAX);
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
         let chain = chain.expect("split the synthetic program");
@@ -928,7 +956,7 @@ mod tests {
             assert_eq!(slot(incoming, saved), slot(outgoing, replacement));
         }
 
-        let chain = lw.s.split_compute(geometry, None, limit, 32).unwrap();
+        let chain = lw.s.split_compute(geometry, None, limit, 32, usize::MAX).unwrap();
         let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
         let initial: Vec<u32> = (0..32).map(|i| 1009 * i + 77).collect();
         let mut expected: Vec<_> = initial.iter().map(|&v| {
@@ -978,7 +1006,7 @@ mod tests {
         lw.s.m.ret();
         lw.s.m.optimize();
         let limit = lw.s.m.blocks.iter().map(Vec::len).max().unwrap();
-        let chain = lw.s.split_compute(geometry, None, limit, 32).expect("every piece validates");
+        let chain = lw.s.split_compute(geometry, None, limit, 32, usize::MAX).expect("every piece validates");
         assert!(chain.pieces.len() >= 2);
     }
 
@@ -1095,7 +1123,7 @@ mod tests {
             let plan = lw.s.m.dispatch_plan(64).expect("partition branch fixture");
             let stage = |b| plan.blocks.iter().position(|blocks| blocks.contains(&b)).unwrap();
             assert!(plan.edges.iter().any(|edge| stage(edge.to) > stage(edge.from) + 1), "exercise a forward skip over an intermediate piece");
-            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64, 32).expect("split branch fixture");
+            let chain = lw.s.split_compute(geometry, split.then_some(tid), 64, 32, usize::MAX).expect("split branch fixture");
             assert!(chain.pieces.len() >= 3);
             let whole = lw.s.finish_optimized(geometry, Some(32)).unwrap();
             crate::gpu::dxil::validate::validate(&whole).expect("valid unsplit fixture");
@@ -1159,6 +1187,75 @@ mod tests {
             }
             println!("CHAIN_BRANCH threads={threads} pieces={} scratch_words_per_group={} checked_words={words} guards=16", chain.pieces.len(), chain.dwords_per_group);
         }
+    }
+
+    /// `n` conditional update pairs on raw UAV memory, one update and one join block each: a
+    /// program whose pieces shrink as the instruction limit does. No GPU is touched.
+    fn pairs_fixture(n: u32) -> (Lw, super::Value) {
+        let threads = [64, 1, 1];
+        let cs = CsInterface { threads, ..Default::default() };
+        let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let mut lw = Lw::new(&[], &Default::default(), options, &Entry::Compute(cs));
+        let (tid, _) = lw.setup_lanes_compute(threads, false);
+        let mem = lw.mems[0];
+        let offset = lw.shlc(tid, 2);
+        let width = lw.s.wave_lane_count();
+        for _ in 0..n {
+            let update = lw.s.m.new_block();
+            let join = lw.s.m.new_block();
+            let taken = lw.cmp(Pred::ULt, tid, width);
+            lw.s.m.cond_br(taken, update, join);
+            lw.s.m.set_block(update);
+            let old = lw.s.raw_load(mem, offset, 1)[0];
+            let new = lw.add(old, width);
+            lw.s.raw_store(mem, offset, &[new]);
+            lw.s.m.br(join);
+            lw.s.m.set_block(join);
+        }
+        lw.s.m.ret();
+        lw.s.m.optimize();
+        (lw, tid)
+    }
+
+    /// A piece over the byte target is re-planned with a halved instruction limit: all pieces
+    /// come out under the target, as the halved plan's.
+    #[test]
+    fn a_piece_over_the_byte_target_splits_smaller() {
+        let (lw, tid) = pairs_fixture(600);
+        let (threads, hw, limit) = ([64, 1, 1], 64, 600);
+        let largest = |c: &super::DispatchChain| c.pieces.iter().map(Vec::len).max().unwrap();
+        let full = lw.s.split_compute(threads, Some(tid), limit, hw, usize::MAX).expect("the fixture splits");
+        let halved = lw.s.split_compute(threads, Some(tid), limit / 2, hw, usize::MAX).expect("the halved limit splits too");
+        assert!(largest(&full) > largest(&halved), "the fixture's pieces must shrink with the limit");
+        let target = largest(&halved) + (largest(&full) - largest(&halved)) / 2;
+        let chain = lw.s.split_compute(threads, Some(tid), limit, hw, target).expect("the re-planned split");
+        assert!(chain.pieces.iter().map(Vec::len).all(|n| n <= target), "every piece under the byte target");
+        assert_eq!(chain.pieces, halved.pieces, "the re-plan is the halved limit's plan");
+        for piece in &chain.pieces {
+            crate::gpu::dxil::validate::validate(piece).expect("valid re-planned piece");
+        }
+    }
+
+    /// Pieces already under the byte target keep their plan: one plan, unchanged.
+    #[test]
+    fn pieces_under_the_byte_target_keep_their_plan() {
+        let (lw, tid) = pairs_fixture(120);
+        let (threads, hw) = ([64, 1, 1], 64);
+        let plain = lw.s.split_compute(threads, Some(tid), 40, hw, usize::MAX).expect("the fixture splits");
+        let target = plain.pieces.iter().map(Vec::len).max().unwrap() + 1;
+        let chain = lw.s.split_compute(threads, Some(tid), 40, hw, target).expect("the fixture splits");
+        assert_eq!((chain.pieces.as_slice(), chain.dwords_per_group), (plain.pieces.as_slice(), plain.dwords_per_group), "no re-plan under the target");
+    }
+
+    /// A byte target no smaller plan reaches keeps the largest valid one: the original plan,
+    /// with one log line saying so.
+    #[test]
+    fn a_piece_no_plan_reaches_stays_the_largest_valid_plan() {
+        let (lw, tid) = pairs_fixture(120);
+        let (threads, hw) = ([64, 1, 1], 64);
+        let plain = lw.s.split_compute(threads, Some(tid), 40, hw, usize::MAX).expect("the fixture splits");
+        let chain = lw.s.split_compute(threads, Some(tid), 40, hw, 1).expect("the chain is kept");
+        assert_eq!(chain.pieces, plain.pieces, "the original (largest valid) plan is kept");
     }
 
 }

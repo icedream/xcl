@@ -313,6 +313,9 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   wave64 (or are the compute pass of a mesh / geometry pipeline) split too once their whole
   translated DXIL exceeds `XCL_DIRECT_SPLIT_LARGE` bytes (default 262144); a program without a
   valid split stays whole, and `XCL_SKIP_BIG_DXIL` no longer refuses a program that splits.
+  A piece whose finished DXIL exceeds `XCL_SPLIT_PIECE_MAX_KB` kilobytes (default 192) is
+  re-planned with a smaller instruction limit; when no smaller plan fits the target, the
+  largest valid plan stays and one log line says so.
 - Huge pipelines (translated DXIL of `XCL_HUGE_PSO_BYTES` or more, default 262144) built on the
   background `xcl-pso*` workers take turns in the driver's compiler: `XCL_HUGE_PSO_CONCURRENCY`
   at once (default 1, maximum 64). Pipelines of 4 MiB or more use a separate one-wide lane so
