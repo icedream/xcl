@@ -662,7 +662,19 @@ impl Lw {
             }
             c
         } else {
-            self.s.try_finish(numthreads, Some(hw))
+            let c = self.s.try_finish(numthreads, Some(hw));
+            if matches!(stage, Stage::Compute) && c.as_ref().is_ok_and(|c| c.len() > dispatch_split_large()) {
+                // the refusals ask why this program never reached `split_compute`
+                let why = if split_tid.is_some() {
+                    "split gate".to_string()
+                } else if numthreads != [64, 1, 1] {
+                    format!("threads {:?}", numthreads)
+                } else {
+                    "uses LDS".to_string()
+                };
+                crate::xlog_info!("compute split: a {} B program was never offered to the splitter ({})", c.as_ref().map_or(0, |c| c.len()), why);
+            }
+            c
         }
         .map_err(|e| format!("direct DXIL builder error: {e}"))?;
         if cfg!(any(test, debug_assertions)) {
