@@ -6941,27 +6941,12 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
-    // a split compute pass goes through the chain machinery a standalone compute PSO uses: the
-    // driver compiles the pieces, never the monolith (the whole stays its fallback)
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let mut compute_rs = rs as usize;
-    let mut hc: HRESULT = S_OK;
-    let mut chained = 0usize;
-    if let Some(plan) = tp.dispatch_chain.as_ref().filter(|c| c.pieces.len() >= 2).cloned() {
-        cold_slot(false); // the pieces are small compiles: no big-compile turn held over them
-        let record = crate::gpu::shader::fnv64(&tp.cs);
-        let iid = pc_iid(Kind::PipelineState);
-        let pieces = plan.pieces.len();
-        if let Some(chain_rs) = dispatch_chain::build(this, fc, &cdesc, &iid, &mut compute as *mut *mut c_void, record, &tp.cs, &tp.samplers, plan) {
-            if !compute.is_null() {
-                compute_rs = chain_rs;
-                chained = pieces;
-            }
-        }
-    }
-    if chained == 0 {
-        // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
-        // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    let compute_rs = rs as usize;
+    let mut hc: HRESULT;
+    // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
+    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    {
         let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
         let mut ccached = compute_blob(ckey);
         let cdisk = driver_cache::path(&tp.cs, 0);
@@ -7026,7 +7011,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     TWO_PASS.lock().unwrap().get_or_insert_with(HashMap::new).insert(mesh_pso as usize, std::sync::Arc::new(TwoPassPso { compute: compute as usize, compute_rs, mesh_rs: mesh_rs as usize, record: tp.record, mesh_groups_per_record: tp.mesh_groups_per_record, kind }));
     let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     if n < 5 || n % 1000 == 0 {
-        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL{})", tp.cs.len(), tp.ms.len(), if chained != 0 { format!(", {} split pieces", chained) } else { String::new() });
+        crate::xlog_info!("D3D12.X: pipeline from the console {kind} in two passes (compute {} B + mesh {} B DXIL)", tp.cs.len(), tp.ms.len());
     }
     hr
 }
@@ -9477,7 +9462,6 @@ mod mesh_stream_tests {
             record: crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 32, max_vertices: 3, max_primitives: 1 },
             mesh_groups_per_record: 1,
             samplers: vec![sampler],
-            dispatch_chain: None,
         };
         let stream = StreamOut::default();
         let iid = pc_iid(Kind::PipelineState);

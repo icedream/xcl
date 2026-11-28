@@ -219,7 +219,6 @@ fn translate_on_this_thread(
     let follow_loads = matches!(entry, Entry::Kernel | Entry::Compute(_));
     let gfx = matches!(entry, Entry::Vertex(_) | Entry::Pixel(_));
     let compute = matches!(entry, Entry::Compute(_));
-    let compute_like = matches!(entry, Entry::Compute(_) | Entry::Mesh(_) | Entry::Geometry(_));
     let split = o.wave64 && o.split && !gfx;
     let leaders: BTreeSet<u64> = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
     let mut lw = Lw::new(&cfg.insts, &leaders, o, &entry);
@@ -462,7 +461,7 @@ fn translate_on_this_thread(
     lw.s.m.set_block(Block(0));
     lw.s.m.br(h0);
     let hw = if split || !o.wave64 { 32 } else { 64 };
-    let limit = if compute_like && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
+    let limit = if compute && (!split || split_tid.is_some()) { dispatch_piece_limit() } else { 0 };
     lw.finish_dispatch(numthreads, hw, limit, split_tid)
 }
 
@@ -778,22 +777,31 @@ fn dispatch_chain_keeps_small_native_wave64_whole() {
     super::validate::validate(&program.dxil).expect("valid whole shader");
 }
 
-/// The mesh pass (a two-pass compute entry, several waves per group) splits over the threshold.
+/// The mesh pass (a two-pass compute entry) no longer asks for a piece limit: the two-pass
+/// compute pass has no dispatch site, so splitting it is dead work.
 #[cfg(test)]
 #[test]
-fn dispatch_chain_splits_large_mesh_pass() {
+fn dispatch_chain_mesh_pass_stays_whole() {
     let threads = [128, 1, 1];
     let ms = crate::gpu::recomp::MsInterface { outputs: Vec::new(), threads: 128, max_vertices: 64, max_primitives: 64 };
     let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
     let (mut lw, tid) = split_fixture(Entry::Mesh(ms), options, threads, 4500);
-    let program = lw.finish_dispatch(threads, 64, dispatch_piece_limit(), Some(tid)).unwrap();
-    assert!(program.dxil.len() > dispatch_split_large(), "the fixture must exceed the threshold: {} B", program.dxil.len());
-    let chain = program.dispatch_chain.expect("the mesh pass splits");
-    assert!(chain.pieces.len() >= 2);
-    for piece in &chain.pieces {
-        super::validate::validate(piece).expect("valid mesh split piece");
-    }
+    let program = lw.finish_dispatch(threads, 64, 0, Some(tid)).unwrap();
+    assert!(program.dispatch_chain.is_none(), "the mesh pass stays whole");
     super::validate::validate(&program.dxil).expect("valid mesh whole shader");
+}
+
+/// Geometry entries likewise no longer ask for a piece limit.
+#[cfg(test)]
+#[test]
+fn dispatch_chain_geometry_stays_whole() {
+    let g = crate::gpu::recomp::GsInterface::default();
+    let threads = [64, 1, 1];
+    let options = KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+    let (mut lw, tid) = split_fixture(Entry::Geometry(g), options, threads, 4500);
+    let program = lw.finish_dispatch(threads, 64, 0, Some(tid)).unwrap();
+    assert!(program.dispatch_chain.is_none(), "the geometry pass stays whole");
+    super::validate::validate(&program.dxil).expect("valid geometry whole shader");
 }
 
 /// The kernel's epilogue: SGPRs and SCC from lane 0, every touched VGPR per lane.
