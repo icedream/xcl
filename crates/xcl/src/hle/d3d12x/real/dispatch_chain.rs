@@ -72,6 +72,18 @@ impl Chain {
 
 static CHAINS: LazyLock<Mutex<HashMap<usize, Arc<Chain>>>> = LazyLock::new(Default::default);
 
+/// The first few dispatch handles with their outcome: with the keys `build` logs, a live run
+/// shows whether a split program's dispatch ever reaches `dispatch`, and with which handle.
+static SEEN: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(Default::default);
+
+fn note_dispatch(pso: usize, chained: bool) {
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() < 32 && !seen.contains(&pso) {
+        seen.push(pso);
+        crate::xlog_info!("compute split: dispatch of pso {pso:#x} – {}", if chained { "through its chain" } else { "no chain, plain Dispatch" });
+    }
+}
+
 pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUTE_PIPELINE_STATE_DESC,
     iid: *const GUID, result: *mut *mut c_void, record: u64, whole: &[u8], samplers: &[pso::StaticSampler],
     plan: Arc<DispatchChain>) -> Option<usize> {
@@ -95,16 +107,48 @@ pub(super) unsafe fn build(this: *mut c_void, create: PsoFn, desc: &D3D12_COMPUT
     let first = pieces.next()?;
     let chain = Arc::new(Chain { builder, tail: pieces.collect(), words: plan.dwords_per_group,
         whole_code: whole.to_vec(), whole: OnceLock::new(), build_whole: Mutex::new(()) });
-    PROGRAMS.fetch_add(1, Ordering::Relaxed);
+    let n = PROGRAMS.fetch_add(1, Ordering::Relaxed);
     PIECES.fetch_add(plan.pieces.len() as u64, Ordering::Relaxed);
     *result = first.into_raw();
     CHAINS.lock().unwrap().insert(*result as usize, chain);
+    if n < 4 {
+        crate::xlog_info!("compute split: chain of {} pieces keyed by its first piece {:#x} (record {record:016x})", plan.pieces.len(), *result as usize);
+    }
     Some(rs)
 }
 
 pub(super) fn forget(pso: usize) {
     let gone = CHAINS.lock().unwrap().remove(&pso);
     drop(gone); // releasing a tail PSO also goes through forget_pso
+}
+
+/// A chain behind `pso` for a test: its handles are stub objects, nothing touches a driver.
+#[cfg(test)]
+fn register_for_test(pso: usize, words: u32, device: ID3D12Device, signature: ID3D12RootSignature) {
+    unsafe extern "system" fn no_pso(_: *mut c_void, _: *const c_void, _: *const GUID, _: *mut *mut c_void) -> crate::util::HRESULT {
+        crate::util::E_NOTIMPL
+    }
+    let builder = unsafe {
+        Arc::new(PipelineBuilder { device, create: no_pso, signature, rs_id: 0, flags: Default::default(), node: 0, record: 0 })
+    };
+    CHAINS.lock().unwrap().insert(pso, Arc::new(Chain { builder, tail: Vec::new(), words,
+        whole_code: Vec::new(), whole: OnceLock::new(), build_whole: Mutex::new(()) }));
+}
+
+/// `list` records with `allocator` on a scratch of `bytes` that needs no device: what a chain
+/// before it on the list would have left in `SHARED`.
+#[cfg(test)]
+fn share_for_test(list: usize, allocator: usize, bytes: u64, buffer: ID3D12Resource) -> Arc<Scratch> {
+    let s = Arc::new(Scratch { buffer, bytes });
+    let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
+    PEAK.fetch_max(live, Ordering::Relaxed);
+    SHARED.lock().unwrap().insert(list, (allocator, Arc::downgrade(&s)));
+    s
+}
+
+#[cfg(test)]
+fn dispatch_counts_for_test() -> (u64, u64) {
+    (DISPATCHES.load(Ordering::Relaxed), SLABS.load(Ordering::Relaxed))
 }
 
 pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<Option<ID3D12PipelineState>, String> {
@@ -208,6 +252,7 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
 pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
+    note_dispatch(pso, chain.is_some());
     let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
@@ -241,6 +286,67 @@ mod tests {
     use super::{scratch_bytes, LEAST};
 
     const MB: u64 = 1 << 20;
+
+    /// The round trip a split compute PSO's dispatch takes, without a device: the stand-in the
+    /// title holds resolves (`pso_async::resolve_wait`, what both dispatch sites call) to the
+    /// first piece, which is the key `build` inserted `CHAINS` under; `dispatch` runs the chain
+    /// and bumps DISPATCHES/SLABS, and a pso without a chain keeps the plain `list.Dispatch`.
+    #[test]
+    fn a_split_pso_dispatches_through_the_chain_and_a_plain_one_the_list() {
+        use std::sync::atomic::Ordering;
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource, ID3D12RootSignature};
+
+        // a stub-backed object: GetType answers DIRECT, every method is a no-op returning 0
+        let object = |name: &str, slots: usize| -> (*mut std::ffi::c_void, Vec<&'static crate::stubs::StubInfo>) {
+            let infos: Vec<_> = (0..slots)
+                .map(|i| crate::stubs::make_stub_info("xcl-test", &format!("{name}::{i}"), 0))
+                .collect();
+            let vtable: &'static [usize] = Box::leak(infos.iter().map(|&(a, _)| a).collect::<Vec<_>>().into_boxed_slice());
+            let obj: &'static mut [usize] = Box::leak(vec![vtable.as_ptr() as usize].into_boxed_slice());
+            (obj.as_mut_ptr().cast(), infos.iter().map(|&(_, i)| i).collect())
+        };
+        let list_slots = 48; // Dispatch is #14, SetComputeRootUnorderedAccessView #41
+        let (list_ptr, list_stubs) = object("FakeCommandList", list_slots);
+        let (resource_ptr, _) = object("FakeResource", 12);
+        let (key_ptr, _) = object("FakeFirstPiece", 8);
+        let (plain_ptr, _) = object("FakePlainPso", 8);
+        let (device_ptr, _) = object("FakeDevice", 16);
+        let (root_ptr, _) = object("FakeRootSignature", 12);
+        let (standin, alloc) = (0x7E57_F001usize, 0x7E57_FA01usize);
+
+        // the handle the dispatch sites compute for the title's stand-in
+        use super::super::super::pso_async;
+        let key = key_ptr as usize;
+        pso_async::submit_lazy(standin, true, Box::new(move || key), 0);
+        let resolved = pso_async::resolve_wait(standin);
+        assert_eq!(resolved, key_ptr as usize, "the stand-in resolves to the chain's key (its first piece)");
+        let _ = pso_async::released(standin);
+
+        super::register_for_test(key_ptr as usize, 4, unsafe { ID3D12Device::from_raw(device_ptr) }, unsafe { ID3D12RootSignature::from_raw(root_ptr) });
+        let scratch = super::share_for_test(list_ptr as usize, alloc, MB, unsafe { ID3D12Resource::from_raw(resource_ptr) });
+        super::super::super::alloc_pool::reset_list(list_ptr as usize, alloc, 0, |_| crate::util::S_OK);
+        let list = unsafe { ID3D12GraphicsCommandList::from_raw(list_ptr) };
+
+        let (before_dispatches, before_slabs) = super::dispatch_counts_for_test();
+        let before_plain = list_stubs[14].calls.load(Ordering::Relaxed);
+        unsafe { super::dispatch(&list, resolved, alloc, [4, 2, 1]) }.expect("the chain's dispatch records");
+        let (chained_dispatches, chained_slabs) = super::dispatch_counts_for_test();
+        assert_eq!(chained_dispatches, before_dispatches + 1, "a split PSO's dispatch bumps DISPATCHES");
+        assert_eq!(chained_slabs, before_slabs + 1, "and SLABS");
+
+        unsafe { super::dispatch(&list, plain_ptr as usize, alloc, [4, 2, 1]) }.expect("the plain dispatch");
+        let (after, _) = super::dispatch_counts_for_test();
+        assert_eq!(after, chained_dispatches, "a pso without a chain is not counted as chained");
+        assert_eq!(list_stubs[14].calls.load(Ordering::Relaxed), before_plain + 2, "both dispatches reached the list's Dispatch");
+
+        drop(list);
+        super::allocator_reset(alloc);
+        super::forget(key_ptr as usize);
+        super::list_reset(list_ptr as usize);
+        super::super::super::alloc_pool::forget_list(list_ptr as usize);
+        drop(scratch);
+    }
 
     #[test]
     fn a_list_recorded_after_another_goes_on_in_its_scratch() {
