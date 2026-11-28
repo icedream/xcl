@@ -779,8 +779,10 @@ pub unsafe extern "system" fn XMemGetWorkingSetStatistics(_flags: u32, stats: *m
         return 0;
     }
     let limit = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
+    let used = process_private_bytes().min(limit);
+    super::mem_view::working_set(limit as u64, used as u64);
     (stats as *mut u64).write_unaligned(limit);
-    (stats.add(8) as *mut u64).write_unaligned(process_private_bytes().min(limit));
+    (stats.add(8) as *mut u64).write_unaligned(used);
     1
 }
 
@@ -850,6 +852,7 @@ pub unsafe extern "system" fn TitleMemoryStatus(buf: *mut TitleMemoryStatusT) ->
     }
     let total = crate::state::config().title_memory_budget_mb() * 1024 * 1024;
     let used = process_private_bytes().min(total);
+    super::mem_view::title_status(total as u64, used as u64);
     let b = &mut *buf;
     b.total = total;
     b.avail = total - used;

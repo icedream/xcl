@@ -20,6 +20,7 @@ pub mod dxcompiler;
 pub mod gameinput;
 pub mod kbm;
 pub mod kernelx;
+pub mod mem_view;
 pub mod mfplat;
 pub mod netoff;
 pub mod opus;

@@ -100,6 +100,9 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64)
                 );
+                if let Some(l) = crate::hle::mem_view::line(crate::hle::mem_view::wanted()) {
+                    crate::xlog_info!("{l}");
+                }
                 last = now;
             }
         });
@@ -147,6 +150,10 @@ pub fn host_main(boot_path: &Path) -> i32 {
     // `XCL_STALL_SNAPSHOT=<seconds>`: what the process is doing when presents stop
     if let Some(secs) = std::env::var("XCL_STALL_SNAPSHOT").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0) {
         crate::eh::start_stall_snapshot(secs);
+    }
+    // `XCL_STACK_DUMP=<seconds>`: dump every thread's stack on a timer (presents keep running, so the stall snapshot never fires)
+    if let Some(secs) = std::env::var("XCL_STACK_DUMP").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0) {
+        crate::eh::start_stack_dump(secs);
     }
     HOST_MODE.store(true, Ordering::Release);
 

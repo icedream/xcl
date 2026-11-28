@@ -1237,6 +1237,20 @@ mod tests {
 /// This is the measurement that separates the ways a load can stop: a present thread waiting on a
 /// compile shows up as a thread inside a PSO build with `still building` above zero; a fence that
 /// never signals shows a thread in a wait; a lock deadlock shows a thread inside XCL's own code.
+pub fn start_stack_dump(seconds: u64) {
+    let _ = std::thread::Builder::new().name("xcl-stackdump".into()).spawn(move || {
+        let mut n = 0u64;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            n += 1;
+            let (built, failed, building) = crate::hle::d3d12x::pso_async::counts();
+            let (presents, executes) = crate::hle::d3d12x::present::activity();
+            crate::xlog_warn!("stack dump #{n}: presents {presents}, submits {executes}; pipelines built {built}, failed {failed}, building {building}");
+            dump_threads();
+        }
+    });
+}
+
 pub fn start_stall_snapshot(seconds: u64) {
     let _ = std::thread::Builder::new().name("xcl-stall".into()).spawn(move || {
         let mut last = crate::hle::d3d12x::present::activity().0;
